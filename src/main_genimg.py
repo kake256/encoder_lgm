@@ -178,18 +178,37 @@ def add_text_overlay(pil_image, text, font_scale=0.15, color=(255, 0, 0)):
     return img
 
 # ==============================================================================
-# [修正] ここに AddGaussianNoise クラス定義を追加
+# [変更] ここに AddGaussianNoise クラス定義を追加 -> RandomGaussianNoise に変更
 # ==============================================================================
-class AddGaussianNoise(object):
-    def __init__(self, mean=0.0, std=1.0):
-        self.std = std
+
+# [元のコード]
+# class AddGaussianNoise(object):
+#     def __init__(self, mean=0.0, std=1.0):
+#         self.std = std
+#         self.mean = mean
+#         
+#     def __call__(self, tensor):
+#         return tensor + torch.randn(tensor.size()).to(tensor.device) * self.std + self.mean
+#     
+#     def __repr__(self):
+#         return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
+
+# [新しいコード] GitHub仕様に合わせたノイズクラス
+class RandomGaussianNoise(nn.Module):
+    def __init__(self, mean=0.0, std=1.0, p=0.5):
+        super().__init__()
         self.mean = mean
+        self.std = std
+        self.p = p
+
+    def forward(self, images):
+        # 確率 p で適用 (GitHub仕様)
+        if torch.rand(1).item() < self.p:
+            return images
         
-    def __call__(self, tensor):
-        return tensor + torch.randn(tensor.size()).to(tensor.device) * self.std + self.mean
-    
-    def __repr__(self):
-        return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
+        # 加算処理
+        noise = torch.randn_like(images) * self.std + self.mean
+        return images + noise
 
 # ==============================================================================
 # 4. MultiModelGM クラス - [変更あり]
@@ -213,12 +232,26 @@ class MultiModelGM:
         
         self.optimizer = self._init_optimizer()
         
+        # [元のコード]
+        # self.augmentor = T.Compose([
+        #     T.RandomResizedCrop(args.image_size, scale=(0.8, 1.0), antialias=True),
+        #     T.RandomHorizontalFlip(p=0.5),
+        #     T.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+        #     T.ColorJitter(0.1, 0.1, 0.1, 0.05),
+        #     AddGaussianNoise(mean=0.0, std=0.05), 
+        # ])
+        
+        # [新しいコード] 引数で挙動を制御できるように変更
         self.augmentor = T.Compose([
-            T.RandomResizedCrop(args.image_size, scale=(0.8, 1.0), antialias=True),
+            # scaleを引数で制御 (GitHub: 0.08, 元コード: 0.8)
+            T.RandomResizedCrop(args.image_size, scale=(args.min_scale, args.max_scale), antialias=True),
+            
             T.RandomHorizontalFlip(p=0.5),
             T.RandomAffine(degrees=10, translate=(0.1, 0.1)),
             T.ColorJitter(0.1, 0.1, 0.1, 0.05),
-            AddGaussianNoise(mean=0.0, std=0.05), # [OK] 定義したのでここでエラーになりません
+            
+            # ノイズも引数で制御 (GitHub: std=0.2, p=0.5)
+            RandomGaussianNoise(mean=0.0, std=args.noise_std, p=args.noise_prob), 
         ])
         
         self.scaler = torch.cuda.amp.GradScaler()
@@ -320,7 +353,6 @@ class MultiModelGM:
             local_pbar.set_description(f"G{gen_idx} L:{l_grad:.3f} R:{self.generator.levels[-1].shape[-1]}")
             global_pbar.update(1)
             
-            # [変更] 途中経過の画像ファイル名にも _genXX を付ける
             if i % 500 == 0:
                 with torch.no_grad():
                     save_image(self.generator().detach().cpu(), os.path.join(save_dir, f"step_{i:04d}_gen{gen_idx:02d}.png"))
@@ -360,7 +392,7 @@ def parse_args():
     parser.add_argument("--weight_grad", type=float, default=1.0)
     parser.add_argument("--weight_tv", type=float, default=0.00025)
     
-    # [追加] 1クラスあたりの生成枚数
+    # 1クラスあたりの生成枚数
     parser.add_argument("--num_generations", type=int, default=1, help="Number of images to generate per class")
     
     # 文字攻撃設定
@@ -372,6 +404,12 @@ def parse_args():
     parser.add_argument("--dataset_type", type=str, default="imagenet") 
     parser.add_argument("--data_root", type=str, default="")
 
+    # [追加] Augmentation制御用パラメータ
+    parser.add_argument("--min_scale", type=float, default=0.08, help="Minimum scale for RandomResizedCrop (GitHub: 0.08, MyCode: 0.8)")
+    parser.add_argument("--max_scale", type=float, default=1.0, help="Maximum scale for RandomResizedCrop")
+    parser.add_argument("--noise_prob", type=float, default=0.5, help="Probability of applying Gaussian noise")
+    parser.add_argument("--noise_std", type=float, default=0.2, help="Standard deviation of Gaussian noise")
+
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -382,8 +420,7 @@ if __name__ == "__main__":
     logger = Logger(args.log_file)
     logger.log(f"Using GPU: {torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else "Using CPU")
 
-    # 評価器の初期化
-    # [変更] ここでの初期化を廃止し、遅延ロードに変更 (VRAM節約)
+    # 評価器の初期化 (遅延ロードのためここでは不要)
     # evaluator = Evaluator(device)
 
     # ImageNetデータのロード
@@ -449,11 +486,6 @@ if __name__ == "__main__":
         # クリーン画像のTensor化（評価のReference用）
         ref_clean_tensor = to_tensor(clean_images_pil[0]).unsqueeze(0).to(device)
 
-        # Clean画像の事前評価
-        # [変更] 遅延ロード対応
-        # clean_vis_score, _, _ = evaluator.calc_visual_score(ref_clean_tensor, target_cls)
-        # clean_text_score, _ = evaluator.calc_text_score(ref_clean_tensor, overlay_text)
-
         # 攻撃画像作成ループ
         for img in clean_images_pil[:args.num_ref_images]: 
             img_with_text = add_text_overlay(img, overlay_text, args.font_scale, args.text_color)
@@ -468,11 +500,8 @@ if __name__ == "__main__":
 
         # Attacked画像(入力)の事前評価
         ref_attacked_tensor = real_images_pool[0].unsqueeze(0)
-        # [変更] 遅延ロード対応
-        # attacked_vis_score, _, _ = evaluator.calc_visual_score(ref_attacked_tensor, target_cls)
-        # attacked_text_score, _ = evaluator.calc_text_score(ref_attacked_tensor, overlay_text)
 
-        # [追加] ここで一時的にEvaluatorを作成してベースライン評価を実行
+        # 一時的にEvaluatorを作成してベースライン評価を実行
         temp_evaluator = Evaluator(device)
         clean_vis_score, _, _ = temp_evaluator.calc_visual_score(ref_clean_tensor, target_cls)
         clean_text_score, _ = temp_evaluator.calc_text_score(ref_clean_tensor, overlay_text)
@@ -486,7 +515,7 @@ if __name__ == "__main__":
             exp_name, weights_str = exp_str.split(':')
             weights = [float(w) for w in weights_str.split(',')]
             
-            # [追加] 必要なモデルだけGPUに配置し、不要なモデルはCPUへ退避
+            # 必要なモデルだけGPUに配置
             manage_model_allocation(models_list, weights, device)
 
             save_dir = os.path.join(args.output_dir, exp_name, f"{target_cls}_{safe_cls_name}")
@@ -495,38 +524,31 @@ if __name__ == "__main__":
             # 参照画像(攻撃済み)の保存
             save_image(real_images_pool[:16], os.path.join(save_dir, "ref_pool_attacked.png"), nrow=4)
 
-            # --- [追加] 複数回生成ループ ---
+            # --- 複数回生成ループ ---
             for gen_idx in range(args.num_generations):
                 current_seed = args.seed + gen_idx
                 set_seed(current_seed)
 
-                # [変更] 世代ごとのサブディレクトリを作成
+                # 世代ごとのサブディレクトリを作成
                 gen_subdir = os.path.join(save_dir, f"gen_{gen_idx:02d}")
                 os.makedirs(gen_subdir, exist_ok=True)
 
-                # 最適化実行 (runにはサブディレクトリを渡す)
+                # 最適化実行
                 lgm = MultiModelGM(models_list, weights, target_cls, args, device)
                 final_img, best_img, metrics = lgm.run(real_images_pool, gen_subdir, dataset_class_names, logger, global_pbar, gen_idx)
                 
-                # 保存 (サブディレクトリ内) - ファイル名にもGen番号を付与
+                # 保存
                 target_img_tensor = best_img if best_img is not None else final_img
                 target_img_tensor = target_img_tensor.to(device)
                 
-                # [変更] サブディレクトリ内のファイル名にも _genXX を付ける
                 save_image(target_img_tensor, os.path.join(gen_subdir, f"result_gen{gen_idx:02d}.png"))
                 with open(os.path.join(gen_subdir, f"metrics_gen{gen_idx:02d}.json"), 'w') as f:
                     json.dump({"args": vars(args), "metrics": metrics}, f, indent=2)
 
-                # [追加] 親ディレクトリにも結果画像をコピー（連番付き）
+                # 親ディレクトリにも結果画像をコピー
                 save_image(target_img_tensor, os.path.join(save_dir, f"result_gen{gen_idx:02d}.png"))
 
                 # --- 即時評価 (On-the-fly Evaluation) ---
-                # [変更] 遅延ロード対応のためコメントアウト
-                # vis_score, top1_idx, top1_prob = evaluator.calc_visual_score(target_img_tensor, target_cls)
-                # text_score, detected_text = evaluator.calc_text_score(target_img_tensor, overlay_text)
-                # ssim_val, lpips_val = evaluator.calc_similarity(target_img_tensor, ref_clean_tensor)
-                
-                # [追加] 評価モデルを一時ロードして評価し、即解放
                 temp_evaluator = Evaluator(device)
                 vis_score, top1_idx, top1_prob = temp_evaluator.calc_visual_score(target_img_tensor, target_cls)
                 text_score, detected_text = temp_evaluator.calc_text_score(target_img_tensor, overlay_text)
