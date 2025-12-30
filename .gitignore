@@ -1,0 +1,23 @@
+# --- 保存したいディレクトリ (src, scripts) 以外を無視 ---
+
+# データセット関連
+Data/
+makeData/
+makeData_old/
+
+# 結果・出力・ログ関連
+classification_results/
+evaluation_results_critique/
+results_lgm/
+visualizations/
+
+# 重みファイル (モデルなど)
+weights/
+
+# その他・バックアップ
+old/
+
+# --- 一般的なシステムファイルやキャッシュ (念のため追加推奨) ---
+.DS_Store
+__pycache__/
+*.pyc
