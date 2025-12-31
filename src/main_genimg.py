@@ -1,143 +1,119 @@
+# =========================
+# main_genimg.py
+# =========================
 import os
 import sys
 import argparse
-import copy
 import json
 import re
-import glob
 import random
 import numpy as np
+import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
+
 import torch
-import torch.optim as optim
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
-import torchvision.transforms as T
 from torchvision.utils import save_image
-from torchvision.transforms.functional import resize, to_tensor, to_pil_image
+from torchvision.transforms.functional import to_tensor, to_pil_image
+from torchvision import datasets as tv_datasets
+from torchvision.datasets.folder import default_loader
+from torchvision.datasets.utils import download_url
 from tqdm import tqdm
 from datasets import load_dataset
-
-# 評価用ライブラリ
 from torchvision import models
+from torch.utils.data import Dataset
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 import easyocr
 
-# 既存のユーティリティ
-from multi_model_utils import EncoderClassifier, PyramidGenerator, TVLoss
+from optimized_model_utils import (
+    EncoderClassifier,
+    MultiModelGM,
+    manage_model_allocation,
+    build_default_augmentor,
+    preprocess_imagenet,
+    infer_amp_dtype,
+)
 
 # ==============================================================================
-# 0. [追加] モデル管理用関数
+# Custom Dataset Definitions (CUB-200)
 # ==============================================================================
-def manage_model_allocation(models, weights, device):
-    """重みが0より大きいモデルだけGPUに載せ、それ以外はCPUに退避する"""
-    for i, model in enumerate(models):
-        if weights[i] > 0:
-            model.to(device)
+class CUB200(Dataset):
+    def __init__(self, root, train=True, transform=None, loader=default_loader, download=False):
+        self.root = os.path.expanduser(root)
+        self.transform = transform
+        self.loader = loader
+        self.train = train
+        self.base_folder = os.path.join(self.root, "CUB_200_2011")
+
+        if download:
+            self._download()
+
+        if not self._check_integrity():
+            raise RuntimeError("Dataset not found or corrupted. You can use download=True to download it")
+
+        self._load_metadata()
+
+    def _load_metadata(self):
+        images = pd.read_csv(os.path.join(self.base_folder, "images.txt"), sep=" ",
+                             names=["img_id", "filepath"])
+        image_class_labels = pd.read_csv(os.path.join(self.base_folder, "image_class_labels.txt"),
+                                         sep=" ", names=["img_id", "target"])
+        train_test_split = pd.read_csv(os.path.join(self.base_folder, "train_test_split.txt"),
+                                       sep=" ", names=["img_id", "is_training_img"])
+
+        data = images.merge(image_class_labels, on="img_id")
+        data = data.merge(train_test_split, on="img_id")
+
+        classes_txt = pd.read_csv(os.path.join(self.base_folder, "classes.txt"), sep=" ",
+                                  names=["class_id", "class_name"])
+        self.classes = classes_txt["class_name"].apply(lambda x: x.split(".")[1].replace("_", " ")).tolist()
+
+        if self.train:
+            self.data = data[data.is_training_img == 1]
         else:
-            model.cpu()
-    torch.cuda.empty_cache()
+            self.data = data[data.is_training_img == 0]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sample = self.data.iloc[idx]
+        path = os.path.join(self.base_folder, "images", sample.filepath)
+        target = sample.target - 1
+        img = self.loader(path)
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, target
+
+    def _check_integrity(self):
+        return os.path.isdir(os.path.join(self.root, "CUB_200_2011"))
+
+    def _download(self):
+        import tarfile
+        url = "https://data.caltech.edu/records/65de6-vp158/files/CUB_200_2011.tgz"
+        filename = "CUB_200_2011.tgz"
+        if not os.path.exists(os.path.join(self.root, filename)):
+            print(f"Downloading {url}...")
+            download_url(url, self.root, filename, None)
+
+        print("Extracting...")
+        tgz_path = os.path.join(self.root, filename)
+        with tarfile.open(tgz_path, "r:gz") as tar:
+            def is_within_directory(directory, target):
+                abs_directory = os.path.abspath(directory)
+                abs_target = os.path.abspath(target)
+                return os.path.commonpath([abs_directory]) == os.path.commonpath([abs_directory, abs_target])
+
+            for member in tar.getmembers():
+                member_path = os.path.join(self.root, member.name)
+                if not is_within_directory(self.root, member_path):
+                    raise RuntimeError(f"Unsafe path detected in tar file: {member.name}")
+            tar.extractall(path=self.root)
 
 # ==============================================================================
-# 1. 評価用クラス (Evaluator) - [変更なし]
+# Helpers
 # ==============================================================================
-class Evaluator:
-    def __init__(self, device):
-        self.device = device
-        
-        # 1. 構造・知覚評価用 (SSIM, LPIPS)
-        self.ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-        self.lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type='alex').to(device)
-
-        # 2. Visual Score用 (ResNet-50)
-        weights = models.ResNet50_Weights.DEFAULT
-        self.resnet = models.resnet50(weights=weights).to(device)
-        self.resnet.eval()
-        self.resnet_transform = weights.transforms()
-
-        # 3. Text Score用 (EasyOCR)
-        use_gpu_ocr = (device.type == 'cuda')
-        self.reader = easyocr.Reader(['en'], gpu=use_gpu_ocr, verbose=False)
-
-    def preprocess_tensor(self, img_tensor):
-        """生成されたTensor(0-1, cuda)を評価用にリサイズ"""
-        return F.interpolate(img_tensor, size=(224, 224), mode='bilinear', align_corners=False)
-
-    def calc_visual_score(self, img_tensor, target_class_idx):
-        """ResNet-50によるVisual Score"""
-        img_tensor = self.preprocess_tensor(img_tensor)
-        with torch.no_grad():
-            processed = self.resnet_transform(img_tensor)
-            logits = self.resnet(processed)
-            probs = F.softmax(logits, dim=1)
-            score = probs[0, target_class_idx].item()
-            top1_prob, top1_idx = torch.max(probs, dim=1)
-        return score, top1_idx.item(), top1_prob.item()
-
-    def calc_text_score(self, img_tensor, target_text):
-        """EasyOCRによるText Score"""
-        if not target_text:
-            return 0.0, ""
-        
-        # Tensor -> Numpy (H, W, C) uint8
-        img_cpu = img_tensor.detach().cpu().squeeze(0) # [C, H, W]
-        img_pil = to_pil_image(img_cpu)
-        img_np = np.array(img_pil)
-
-        results = self.reader.readtext(img_np)
-        max_score = 0.0
-        detected_text = ""
-        target_clean = target_text.lower().strip()
-        
-        for bbox, text, conf in results:
-            text_clean = text.lower().strip()
-            # 簡易的な包含判定
-            if target_clean in text_clean or text_clean in target_clean:
-                if conf > max_score:
-                    max_score = conf
-                    detected_text = text
-        
-        return max_score, detected_text
-
-    def calc_similarity(self, gen_tensor, ref_tensor):
-        """SSIMとLPIPS (ref_tensorはClean画像)"""
-        gen_resized = self.preprocess_tensor(gen_tensor)
-        ref_resized = self.preprocess_tensor(ref_tensor)
-        
-        with torch.no_grad():
-            ssim = self.ssim_metric(gen_resized, ref_resized).item()
-            lpips = self.lpips_metric(gen_resized, ref_resized).item()
-        return ssim, lpips
-
-# ==============================================================================
-# 2. Logger Class - [変更なし]
-# ==============================================================================
-class Logger:
-    def __init__(self, log_path=None):
-        self.log_path = log_path
-        if log_path:
-            log_dir = os.path.dirname(log_path)
-            if log_dir:
-                os.makedirs(log_dir, exist_ok=True)
-            self.file = open(log_path, 'w', encoding='utf-8')
-        else:
-            self.file = None
-
-    def log(self, message):
-        tqdm.write(message)
-        if self.file:
-            self.file.write(message + '\n')
-            self.file.flush()
-
-    def close(self):
-        if self.file:
-            self.file.close()
-
-# ==============================================================================
-# 3. Helper Functions & 文字合成
-# ==============================================================================
-
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -145,243 +121,163 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
 
 def sanitize_dirname(name):
-    safe_name = re.sub(r'[^a-zA-Z0-9]', '_', name)
-    return safe_name.strip('_')
+    safe_name = re.sub(r"[^a-zA-Z0-9]", "_", name)
+    return safe_name.strip("_")
 
 def add_text_overlay(pil_image, text, font_scale=0.15, color=(255, 0, 0)):
-    """画像の中央付近に文字を書き込む"""
     img = pil_image.copy()
     draw = ImageDraw.Draw(img)
     w, h = img.size
-    
+
     font_size = int(h * font_scale)
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-    except:
+    except Exception:
         font = ImageFont.load_default()
-        
+
     try:
         left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
         text_w = right - left
         text_h = bottom - top
-    except:
+    except Exception:
         text_w, text_h = draw.textsize(text, font=font)
-        
+
     x = (w - text_w) // 2
     y = (h - text_h) // 2
-    
     draw.text((x, y), text, fill=color, font=font)
     return img
 
-# ==============================================================================
-# [変更] ここに AddGaussianNoise クラス定義を追加 -> RandomGaussianNoise に変更
-# ==============================================================================
+class Logger:
+    def __init__(self, log_path=None):
+        self.log_path = log_path
+        if log_path:
+            log_dir = os.path.dirname(log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            self.file = open(log_path, "w", encoding="utf-8")
+        else:
+            self.file = None
 
-# [元のコード]
-# class AddGaussianNoise(object):
-#     def __init__(self, mean=0.0, std=1.0):
-#         self.std = std
-#         self.mean = mean
-#         
-#     def __call__(self, tensor):
-#         return tensor + torch.randn(tensor.size()).to(tensor.device) * self.std + self.mean
-#     
-#     def __repr__(self):
-#         return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
+    def log(self, message):
+        tqdm.write(message)
+        if self.file:
+            self.file.write(message + "\n")
+            self.file.flush()
 
-# [新しいコード] GitHub仕様に合わせたノイズクラス
-class RandomGaussianNoise(nn.Module):
-    def __init__(self, mean=0.0, std=1.0, p=0.5):
-        super().__init__()
-        self.mean = mean
-        self.std = std
-        self.p = p
-
-    def forward(self, images):
-        # 確率 p で適用 (GitHub仕様)
-        if torch.rand(1).item() < self.p:
-            return images
-        
-        # 加算処理
-        noise = torch.randn_like(images) * self.std + self.mean
-        return images + noise
+    def close(self):
+        if self.file:
+            self.file.close()
 
 # ==============================================================================
-# 4. MultiModelGM クラス - [変更あり]
+# Evaluator
 # ==============================================================================
-
-class MultiModelGM:
-    def __init__(self, models, model_weights, target_class, args, device, initial_image=None):
-        self.models = models
-        self.model_weights = model_weights
-        self.target_class = target_class
-        self.args = args
+class Evaluator:
+    def __init__(self, device, logger=None):
         self.device = device
-        
-        self.generator = PyramidGenerator(
-            target_size=args.image_size,
-            start_size=args.pyramid_start_res,
-            activation='sigmoid',
-            initial_image=initial_image,
-            noise_level=args.seed_noise_level
-        ).to(device)
-        
-        self.optimizer = self._init_optimizer()
-        
-        # [元のコード]
-        # self.augmentor = T.Compose([
-        #     T.RandomResizedCrop(args.image_size, scale=(0.8, 1.0), antialias=True),
-        #     T.RandomHorizontalFlip(p=0.5),
-        #     T.RandomAffine(degrees=10, translate=(0.1, 0.1)),
-        #     T.ColorJitter(0.1, 0.1, 0.1, 0.05),
-        #     AddGaussianNoise(mean=0.0, std=0.05), 
-        # ])
-        
-        # [新しいコード] 引数で挙動を制御できるように変更
-        self.augmentor = T.Compose([
-            # scaleを引数で制御 (GitHub: 0.08, 元コード: 0.8)
-            T.RandomResizedCrop(args.image_size, scale=(args.min_scale, args.max_scale), antialias=True),
-            
-            T.RandomHorizontalFlip(p=0.5),
-            T.RandomAffine(degrees=10, translate=(0.1, 0.1)),
-            T.ColorJitter(0.1, 0.1, 0.1, 0.05),
-            
-            # ノイズも引数で制御 (GitHub: std=0.2, p=0.5)
-            RandomGaussianNoise(mean=0.0, std=args.noise_std, p=args.noise_prob), 
-        ])
-        
-        self.scaler = torch.cuda.amp.GradScaler()
-        self.tv_loss_fn = TVLoss().to(device)
 
-    def _init_optimizer(self):
-        return optim.Adam(self.generator.parameters(), lr=self.args.lr)
+        self.ssim_metric = None
+        self.lpips_metric = None
+        try:
+            self.ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+        except Exception as e:
+            if logger:
+                logger.log(f"[Warn] SSIM disabled: {e}")
 
-    def preprocess(self, img):
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
-        return (img - mean) / std
+        try:
+            self.lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type="alex").to(device)
+        except Exception as e:
+            if logger:
+                logger.log(f"[Warn] LPIPS disabled: {e}")
 
-    def get_grads(self, model, inputs, create_graph=False):
-        params = list(model.classifier.parameters())
-        logits = model(inputs)
-        targets = torch.tensor([self.target_class] * inputs.size(0), device=self.device)
-        loss = F.cross_entropy(logits, targets)
-        grads = torch.autograd.grad(loss, params, create_graph=create_graph)
-        flat_grad = torch.cat([g.view(-1) for g in grads])
-        return flat_grad
+        weights = models.ResNet50_Weights.DEFAULT
+        self.resnet = models.resnet50(weights=weights).to(device)
+        self.resnet.eval()
+        self.resnet_transform = weights.transforms()
 
-    def optimize_step(self, real_images_pool):
-        self.optimizer.zero_grad()
-        syn_image = self.generator()
-        
+        self.reader = None
+        try:
+            use_gpu_ocr = (device.type == "cuda")
+            self.reader = easyocr.Reader(["en"], gpu=use_gpu_ocr, verbose=False)
+        except Exception as e1:
+            if logger:
+                logger.log(f"[Warn] EasyOCR GPU init failed, fallback to CPU: {e1}")
+            try:
+                self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+            except Exception as e2:
+                if logger:
+                    logger.log(f"[Warn] EasyOCR disabled: {e2}")
+                self.reader = None
+
+    def preprocess_tensor(self, img_tensor):
+        return F.interpolate(img_tensor, size=(224, 224), mode="bilinear", align_corners=False)
+
+    def calc_visual_score(self, img_tensor, target_class_idx):
+        img_tensor = self.preprocess_tensor(img_tensor)
         with torch.no_grad():
-            indices = torch.randperm(len(real_images_pool))[:self.args.num_ref_images]
-            real_batch = real_images_pool[indices].detach()
-            aug_real = self.augmentor(real_batch)
-            inp_real = self.preprocess(aug_real)
+            processed = self.resnet_transform(img_tensor)
+            logits = self.resnet(processed)
+            probs = F.softmax(logits, dim=1)
+            if target_class_idx < 1000:
+                score = probs[0, target_class_idx].item()
+            else:
+                score = 0.0
+            top1_prob, top1_idx = torch.max(probs, dim=1)
+        return score, top1_idx.item(), top1_prob.item()
 
-        syn_batch_list = []
-        for _ in range(self.args.augs_per_step):
-            syn_batch_list.append(self.augmentor(syn_image))
-        syn_batch = torch.cat(syn_batch_list, dim=0)
-        inp_syn = self.preprocess(syn_batch)
+    def calc_text_score(self, img_tensor, target_text):
+        if (not target_text) or (self.reader is None):
+            return 0.0, ""
 
-        total_grad_loss = 0.0
-        per_model_sims = {}
-        
-        for i, model in enumerate(self.models):
-            weight = self.model_weights[i]
-            if weight == 0: continue
+        img_cpu = img_tensor.detach().cpu().squeeze(0)
+        img_pil = to_pil_image(img_cpu)
+        img_np = np.array(img_pil)
 
-            model.reset_classifier()
-            
-            with autocast():
-                target_grad = self.get_grads(model, inp_real, create_graph=False)
-            with autocast():
-                syn_grad = self.get_grads(model, inp_syn, create_graph=True)
-            
-            sim = F.cosine_similarity(target_grad.unsqueeze(0).detach(), syn_grad.unsqueeze(0)).mean()
-            loss_k = 1.0 - sim
-            total_grad_loss += loss_k * weight
-            
-            model_name = self.args.encoder_names[i] if i < len(self.args.encoder_names) else f"model_{i}"
-            per_model_sims[model_name] = sim.item()
+        results = self.reader.readtext(img_np)
+        max_score = 0.0
+        detected_text = ""
+        target_clean = target_text.lower().strip()
 
-        loss_tv = self.tv_loss_fn(syn_image)
-        total_loss = (total_grad_loss * self.args.weight_grad) + (loss_tv * self.args.weight_tv)
-        
-        self.scaler.scale(total_loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        
-        return total_grad_loss.item(), loss_tv.item(), per_model_sims, total_loss.item()
+        for bbox, text, conf in results:
+            text_clean = text.lower().strip()
+            if target_clean in text_clean or text_clean in target_clean:
+                if conf > max_score:
+                    max_score = conf
+                    detected_text = text
+        return max_score, detected_text
 
-    def run(self, real_images_pool, save_dir, class_names, logger, global_pbar, gen_idx=0):
-        # save_dirは各世代ごとのフォルダ (gen_XX) を受け取る
-        logger.log(f"[{self.target_class}][Gen {gen_idx}] Optimization Start. Pool size: {len(real_images_pool)}")
-        loss_history = []
-        
-        best_loss = float('inf')
-        best_img_tensor = None
-
-        local_pbar = tqdm(range(self.args.num_iterations), desc=f"Exp {self.target_class}-G{gen_idx}", leave=False, position=1, dynamic_ncols=True)
-        
-        for i in local_pbar:
-            if i > 0 and i % self.args.pyramid_grow_interval == 0:
-                if self.generator.extend():
-                    self.optimizer = self._init_optimizer()
-            
-            l_grad, l_tv, model_sims, current_total_loss = self.optimize_step(real_images_pool)
-            
-            if current_total_loss < best_loss:
-                best_loss = current_total_loss
-                best_img_tensor = self.generator().detach().cpu()
-
-            if i % 100 == 0:
-                if logger.file:
-                    logger.file.write(f"__PROGRESS__ Gen{gen_idx} {i}/{self.args.num_iterations} {l_grad:.4f}\n")
-
-            step_metrics = {"loss_grad": l_grad, "loss_tv": l_tv, "total_loss": current_total_loss}
-            for m_name, m_sim in model_sims.items():
-                step_metrics[f"sim_{m_name}"] = m_sim
-            loss_history.append(step_metrics)
-            
-            local_pbar.set_description(f"G{gen_idx} L:{l_grad:.3f} R:{self.generator.levels[-1].shape[-1]}")
-            global_pbar.update(1)
-            
-            if i % 500 == 0:
-                with torch.no_grad():
-                    save_image(self.generator().detach().cpu(), os.path.join(save_dir, f"step_{i:04d}_gen{gen_idx:02d}.png"))
-
-        final_img = self.generator().detach().cpu()
-        return final_img, best_img_tensor, {"loss_history": loss_history}
-
+    def calc_similarity(self, gen_tensor, ref_tensor):
+        gen_resized = self.preprocess_tensor(gen_tensor)
+        ref_resized = self.preprocess_tensor(ref_tensor)
+        with torch.no_grad():
+            ssim = self.ssim_metric(gen_resized, ref_resized).item() if self.ssim_metric is not None else float("nan")
+            lpips = self.lpips_metric(gen_resized, ref_resized).item() if self.lpips_metric is not None else float("nan")
+        return ssim, lpips
 
 # ==============================================================================
-# 5. Main (文字合成と評価ループ) - [変更あり]
+# Args, Dataset
 # ==============================================================================
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="Multi-Model LGM with Text Overlay")
-    
-    # モデル設定
-    parser.add_argument("--encoder_names", type=str, nargs='+', required=True, help="List of encoder models")
-    parser.add_argument("--projection_dims", type=int, nargs='+', default=[2048], help="Projection dims")
-    parser.add_argument("--experiments", type=str, nargs='+', required=True, help="List of experiments (name:w1,w2,w3)")
-    
-    # 出力・データ設定
-    parser.add_argument("--output_dir", type=str, default="./lgm_text_attack_results")
-    parser.add_argument("--target_classes", type=str, nargs='+', default=[], help="Target class IDs (ImageNet)")
+    parser = argparse.ArgumentParser(description="Multi-Model LGM (Optimized)")
+
+    parser.add_argument("--encoder_names", type=str, nargs="+", required=True)
+    parser.add_argument("--projection_dims", type=int, nargs="+", default=[2048])
+    parser.add_argument("--experiments", type=str, nargs="+", required=True)
+
+    parser.add_argument("--output_dir", type=str, default="./lgm_results")
+    parser.add_argument("--target_classes", type=str, nargs="+", default=[])
     parser.add_argument("--initial_image_path", type=str, default=None)
     parser.add_argument("--seed_noise_level", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_file", type=str, default="training_log.txt")
 
-    # 学習パラメータ
     parser.add_argument("--num_ref_images", type=int, default=10)
     parser.add_argument("--augs_per_step", type=int, default=32)
     parser.add_argument("--num_iterations", type=int, default=5000)
@@ -391,64 +287,178 @@ def parse_args():
     parser.add_argument("--pyramid_grow_interval", type=int, default=400)
     parser.add_argument("--weight_grad", type=float, default=1.0)
     parser.add_argument("--weight_tv", type=float, default=0.00025)
-    
-    # 1クラスあたりの生成枚数
-    parser.add_argument("--num_generations", type=int, default=1, help="Number of images to generate per class")
-    
-    # 文字攻撃設定
-    parser.add_argument("--overlay_text", type=str, default="ipod", help="Text to write on image (Conflict)")
-    parser.add_argument("--text_color", type=str, default="red", help="Color of the text")
-    parser.add_argument("--font_scale", type=float, default=0.15, help="Size of text relative to image")
-    
-    # ImageNet用
-    parser.add_argument("--dataset_type", type=str, default="imagenet") 
-    parser.add_argument("--data_root", type=str, default="")
 
-    # [追加] Augmentation制御用パラメータ
-    parser.add_argument("--min_scale", type=float, default=0.08, help="Minimum scale for RandomResizedCrop (GitHub: 0.08, MyCode: 0.8)")
-    parser.add_argument("--max_scale", type=float, default=1.0, help="Maximum scale for RandomResizedCrop")
-    parser.add_argument("--noise_prob", type=float, default=0.5, help="Probability of applying Gaussian noise")
-    parser.add_argument("--noise_std", type=float, default=0.2, help="Standard deviation of Gaussian noise")
+    parser.add_argument("--num_generations", type=int, default=1)
+
+    parser.add_argument("--overlay_text", type=str, default="")
+    parser.add_argument("--text_color", type=str, default="red")
+    parser.add_argument("--font_scale", type=float, default=0.15)
+
+    parser.add_argument("--dataset_type", type=str, default="imagenet", choices=["imagenet", "food101", "cub200"])
+    parser.add_argument("--data_root", type=str, default="./data")
+
+    parser.add_argument("--min_scale", type=float, default=0.08)
+    parser.add_argument("--max_scale", type=float, default=1.0)
+    parser.add_argument("--noise_prob", type=float, default=0.5)
+    parser.add_argument("--noise_std", type=float, default=0.2)
+
+    parser.add_argument("--class_id_base", type=int, default=0, choices=[0, 1])
+    parser.add_argument("--hf_streaming", action="store_true")
+
+    parser.add_argument("--debug_grid_n", type=int, default=16)
+    parser.add_argument("--debug_grid_nrow", type=int, default=4)
 
     return parser.parse_args()
 
+def load_dataset_by_type(args, logger):
+    if args.dataset_type == "imagenet":
+        logger.log("Loading ImageNet (Hugging Face)...")
+        dataset = load_dataset("imagenet-1k", split="validation", streaming=bool(args.hf_streaming))
+        if args.hf_streaming:
+            class_names = [str(i) for i in range(1000)]
+        else:
+            class_names = dataset.features["label"].names
+        return dataset, class_names, "hf"
+
+    if args.dataset_type == "food101":
+        logger.log(f"Loading Food-101 (Torchvision), root={args.data_root} ...")
+        try:
+            dataset = tv_datasets.Food101(root=args.data_root, split="train", download=True)
+        except Exception as e:
+            logger.log(f"[Warn] Food101 download=True failed: {e}")
+            logger.log("Retrying Food101 with download=False.")
+            dataset = tv_datasets.Food101(root=args.data_root, split="train", download=False)
+        return dataset, dataset.classes, "tv"
+
+    if args.dataset_type == "cub200":
+        logger.log("Loading CUB-200-2011 (Custom)...")
+        dataset = CUB200(root=args.data_root, train=True, download=True)
+        return dataset, dataset.classes, "tv"
+
+    raise ValueError(f"Unknown dataset type: {args.dataset_type}")
+
+def _get_label_array_for_tv_dataset(dataset):
+    if hasattr(dataset, "_labels"):
+        return np.asarray(dataset._labels)
+    if hasattr(dataset, "data") and isinstance(dataset.data, pd.DataFrame) and ("target" in dataset.data.columns):
+        return np.asarray(dataset.data["target"].values) - 1
+    return None
+
+def get_images_of_class_random_k(dataset, dataset_source_type, target_cls_idx, k, image_size, logger=None):
+    collected = []
+
+    if dataset_source_type == "hf":
+        for item in dataset:
+            if item["label"] == target_cls_idx:
+                img = item["image"].convert("RGB").resize((image_size, image_size))
+                collected.append(img)
+                if len(collected) >= k:
+                    break
+        if logger:
+            logger.log(f"[Debug] HF class={target_cls_idx}, collected={len(collected)} (sequential)")
+        return collected
+
+    labels = _get_label_array_for_tv_dataset(dataset)
+    if labels is None:
+        if logger:
+            logger.log("[Warn] labels array not found, scanning full dataset (slow).")
+        idxs = []
+        for i in range(len(dataset)):
+            _, y = dataset[i]
+            if int(y) == int(target_cls_idx):
+                idxs.append(i)
+        idxs = np.asarray(idxs, dtype=np.int64)
+    else:
+        idxs = np.where(labels == target_cls_idx)[0]
+
+    if logger:
+        logger.log(f"[Debug] class={target_cls_idx}, class_population={len(idxs)}")
+
+    if len(idxs) == 0:
+        return []
+
+    k_eff = min(int(k), int(len(idxs)))
+    chosen = np.random.choice(idxs, size=k_eff, replace=False)
+
+    for idx in chosen:
+        img, _ = dataset[int(idx)]
+        if not isinstance(img, Image.Image):
+            img = to_pil_image(img)
+        img = img.convert("RGB").resize((image_size, image_size))
+        collected.append(img)
+
+    if logger:
+        logger.log(f"[Debug] class={target_cls_idx}, sampled={len(collected)}")
+    return collected
+
+# ==============================================================================
+# NEW, class×gen 単位の real_feats 事前計算
+# ==============================================================================
+@torch.no_grad()
+def precompute_real_features_once_per_class_gen(
+    models_list,
+    real_images_pool,
+    args,
+    device,
+    amp_dtype,
+    logger=None,
+):
+    """
+    class と gen が固定の範囲で, real_feats を一回だけ計算して返す.
+    experiments 間で再利用する前提.
+    """
+    augmentor = build_default_augmentor(args)
+    indices = torch.randperm(len(real_images_pool))[:min(args.num_ref_images, len(real_images_pool))]
+    real_batch = real_images_pool[indices].detach()
+
+    aug_real = augmentor(real_batch)
+    inp_real = preprocess_imagenet(aug_real, device=device)
+
+    cached = [None] * len(models_list)
+    for i, model in enumerate(models_list):
+        # weights に依存させず, 全モデル分計算してしまう方が experiments 間共有が単純.
+        with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+            feats = model.forward_features(inp_real)
+        cached[i] = feats.detach()
+
+    if logger is not None:
+        logger.log(f"[Cache] computed real_feats once, batch={inp_real.shape[0]}, amp_dtype={str(amp_dtype)}")
+    return cached
+
+# ==============================================================================
+# Main
+# ==============================================================================
 if __name__ == "__main__":
     args = parse_args()
     set_seed(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     logger = Logger(args.log_file)
     logger.log(f"Using GPU: {torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else "Using CPU")
 
-    # 評価器の初期化 (遅延ロードのためここでは不要)
-    # evaluator = Evaluator(device)
+    logger.log("Initializing Evaluator...")
+    evaluator = Evaluator(device, logger=logger)
 
-    # ImageNetデータのロード
-    logger.log("Loading ImageNet validation set...")
-    try:
-        dataset = load_dataset("imagenet-1k", split="validation", streaming=False)
-        dataset_class_names = dataset.features['label'].names
-    except:
-        logger.log("Error: Failed to load ImageNet. Ensure 'datasets' library is installed and logged in.")
-        sys.exit(1)
+    dataset, dataset_class_names, dataset_source_type = load_dataset_by_type(args, logger)
+    logger.log(f"Dataset Loaded: {args.dataset_type}, Classes: {len(dataset_class_names)}")
 
-    # ターゲットクラスIDのパース
-    target_ids_to_run = []
     if not args.target_classes:
-        logger.log("No target classes specified. Exiting.")
+        logger.log("No target classes provided, exiting.")
         sys.exit(0)
-    
+
+    target_ids_to_run = []
     for t in args.target_classes:
         try:
-            target_ids_to_run.append(int(t))
-        except:
-            pass
+            cid = int(t) - args.class_id_base
+            target_ids_to_run.append(cid)
+        except Exception:
+            logger.log(f"[Warn] Could not parse target class: {t}")
 
-    # モデルリスト初期化
     models_list = []
     proj_dims = args.projection_dims
-    if len(proj_dims) == 1: proj_dims = proj_dims * len(args.encoder_names)
-    
+    if len(proj_dims) == 1:
+        proj_dims = proj_dims * len(args.encoder_names)
+
     logger.log("Initializing Models...")
     for name, p_dim in zip(args.encoder_names, proj_dims):
         m = EncoderClassifier(name, freeze_encoder=True, num_classes=1000, projection_dim=p_dim)
@@ -456,141 +466,168 @@ if __name__ == "__main__":
         m.eval()
         models_list.append(m)
 
-    # プログレスバー
+    # --- new, amp dtype を最初に確定して固定 ---
+    amp_dtype = infer_amp_dtype(device)
+    logger.log(f"[AMP] fixed amp_dtype={str(amp_dtype)}")
+
     total_steps = len(target_ids_to_run) * len(args.experiments) * args.num_generations * args.num_iterations
     global_pbar = tqdm(total=total_steps, unit="step", desc="Total Progress", position=0, dynamic_ncols=True)
 
-    # 実験結果をまとめるリスト
     evaluation_results = []
 
-    # --- クラスループ ---
     for target_cls in target_ids_to_run:
+        if target_cls < 0 or target_cls >= len(dataset_class_names):
+            logger.log(f"Skipping class ID {target_cls}, out of range.")
+            continue
+
         class_name = dataset_class_names[target_cls]
         safe_cls_name = sanitize_dirname(class_name)
-        
-        # 1. 参照画像の収集 (Clean)
-        clean_images_pil = []
-        MAX_POOL = 50
-        for item in dataset:
-            if item['label'] == target_cls:
-                img = item['image'].convert('RGB').resize((args.image_size, args.image_size))
-                clean_images_pil.append(img)
-                if len(clean_images_pil) >= MAX_POOL: break
-        
-        if not clean_images_pil: continue
-        
-        # 2. 文字合成 (Text Overlay)
-        overlay_text = args.overlay_text
-        attacked_images_tensor = []
-        
-        # クリーン画像のTensor化（評価のReference用）
-        ref_clean_tensor = to_tensor(clean_images_pil[0]).unsqueeze(0).to(device)
+        logger.log(f"Preparing class: {target_cls} ({class_name})")
 
-        # 攻撃画像作成ループ
-        for img in clean_images_pil[:args.num_ref_images]: 
-            img_with_text = add_text_overlay(img, overlay_text, args.font_scale, args.text_color)
+        clean_images_pil = get_images_of_class_random_k(
+            dataset,
+            dataset_source_type,
+            target_cls,
+            k=args.num_ref_images,
+            image_size=args.image_size,
+            logger=logger
+        )
+        if not clean_images_pil:
+            logger.log(f"No images found for class {target_cls}.")
+            continue
+
+        overlay_text = args.overlay_text
+
+        attacked_images_tensor = []
+        for img in clean_images_pil:
+            if overlay_text:
+                img_with_text = add_text_overlay(img, overlay_text, args.font_scale, args.text_color)
+            else:
+                img_with_text = img
             attacked_images_tensor.append(to_tensor(img_with_text))
-            
-            if len(attacked_images_tensor) == 1:
-                debug_dir = os.path.join(args.output_dir, "debug_inputs")
-                os.makedirs(debug_dir, exist_ok=True)
-                img_with_text.save(os.path.join(debug_dir, f"{target_cls}_{safe_cls_name}_attacked.png"))
-        
+
         real_images_pool = torch.stack(attacked_images_tensor).to(device)
 
-        # Attacked画像(入力)の事前評価
+        debug_dir = os.path.join(args.output_dir, "debug_inputs")
+        os.makedirs(debug_dir, exist_ok=True)
+        grid_n = min(args.debug_grid_n, real_images_pool.shape[0])
+        save_image(
+            real_images_pool[:grid_n].detach().cpu(),
+            os.path.join(debug_dir, f"{args.dataset_type}_{target_cls}_{safe_cls_name}_ref_inputs_grid.png"),
+            nrow=args.debug_grid_nrow
+        )
+
+        ref_clean_tensor = to_tensor(clean_images_pil[0]).unsqueeze(0).to(device)
         ref_attacked_tensor = real_images_pool[0].unsqueeze(0)
 
-        # 一時的にEvaluatorを作成してベースライン評価を実行
-        temp_evaluator = Evaluator(device)
-        clean_vis_score, _, _ = temp_evaluator.calc_visual_score(ref_clean_tensor, target_cls)
-        clean_text_score, _ = temp_evaluator.calc_text_score(ref_clean_tensor, overlay_text)
-        attacked_vis_score, _, _ = temp_evaluator.calc_visual_score(ref_attacked_tensor, target_cls)
-        attacked_text_score, _ = temp_evaluator.calc_text_score(ref_attacked_tensor, overlay_text)
-        del temp_evaluator
-        torch.cuda.empty_cache()
+        clean_vis_score, _, _ = evaluator.calc_visual_score(ref_clean_tensor, target_cls)
+        clean_text_score, _ = evaluator.calc_text_score(ref_clean_tensor, overlay_text)
+        attacked_vis_score, _, _ = evaluator.calc_visual_score(ref_attacked_tensor, target_cls)
+        attacked_text_score, _ = evaluator.calc_text_score(ref_attacked_tensor, overlay_text)
 
-        # --- 実験ループ ---
+        # experiments 前に共通出力dirだけ用意.
+        # （expごとに下に保存する設計は維持）
         for exp_str in args.experiments:
-            exp_name, weights_str = exp_str.split(':')
-            weights = [float(w) for w in weights_str.split(',')]
-            
-            # 必要なモデルだけGPUに配置
-            manage_model_allocation(models_list, weights, device)
-
-            save_dir = os.path.join(args.output_dir, exp_name, f"{target_cls}_{safe_cls_name}")
+            exp_name, _ = exp_str.split(":")
+            save_dir = os.path.join(args.output_dir, f"{args.dataset_type}_{exp_name}", f"{target_cls}_{safe_cls_name}")
             os.makedirs(save_dir, exist_ok=True)
-            
-            # 参照画像(攻撃済み)の保存
-            save_image(real_images_pool[:16], os.path.join(save_dir, "ref_pool_attacked.png"), nrow=4)
+            save_image(real_images_pool[:min(16, real_images_pool.shape[0])],
+                       os.path.join(save_dir, "ref_pool.png"), nrow=4)
 
-            # --- 複数回生成ループ ---
-            for gen_idx in range(args.num_generations):
-                current_seed = args.seed + gen_idx
-                set_seed(current_seed)
+        # --- gen loop ---
+        for gen_idx in range(args.num_generations):
+            current_seed = args.seed + gen_idx
+            set_seed(current_seed)
 
-                # 世代ごとのサブディレクトリを作成
+            # --- old ---
+            # exp ごとに MultiModelGM を作り, そのたびに precompute_real_features を呼んでいた.
+            # これだと experiments 数だけ real encoder forward が走る.
+
+            # --- new ---
+            # class×gen 単位で一度だけ real_feats を作り, experiments 間で再利用する.
+            cached_real_features = precompute_real_features_once_per_class_gen(
+                models_list=models_list,
+                real_images_pool=real_images_pool,
+                args=args,
+                device=device,
+                amp_dtype=amp_dtype,
+                logger=logger,
+            )
+
+            # --- experiments loop ---
+            for exp_str in args.experiments:
+                exp_name, weights_str = exp_str.split(":")
+                weights = [float(w) for w in weights_str.split(",")]
+
+                manage_model_allocation(models_list, weights, device)
+
+                save_dir = os.path.join(args.output_dir, f"{args.dataset_type}_{exp_name}", f"{target_cls}_{safe_cls_name}")
                 gen_subdir = os.path.join(save_dir, f"gen_{gen_idx:02d}")
                 os.makedirs(gen_subdir, exist_ok=True)
 
-                # 最適化実行
-                lgm = MultiModelGM(models_list, weights, target_cls, args, device)
-                final_img, best_img, metrics = lgm.run(real_images_pool, gen_subdir, dataset_class_names, logger, global_pbar, gen_idx)
-                
-                # 保存
+                lgm = MultiModelGM(
+                    models=models_list,
+                    model_weights=weights,
+                    target_class=target_cls,
+                    args=args,
+                    device=device,
+                    initial_image=None,
+                    cached_real_features=cached_real_features,
+                    amp_dtype=amp_dtype,
+                )
+
+                # --- old ---
+                # lgm.precompute_real_features(real_images_pool)
+
+                final_img, best_img, metrics = lgm.run(
+                    real_images_pool,
+                    gen_subdir,
+                    dataset_class_names,
+                    logger,
+                    global_pbar,
+                    gen_idx
+                )
+
                 target_img_tensor = best_img if best_img is not None else final_img
                 target_img_tensor = target_img_tensor.to(device)
-                
-                save_image(target_img_tensor, os.path.join(gen_subdir, f"result_gen{gen_idx:02d}.png"))
-                with open(os.path.join(gen_subdir, f"metrics_gen{gen_idx:02d}.json"), 'w') as f:
-                    json.dump({"args": vars(args), "metrics": metrics}, f, indent=2)
 
-                # 親ディレクトリにも結果画像をコピー
+                save_image(target_img_tensor, os.path.join(gen_subdir, f"result_gen{gen_idx:02d}.png"))
+                with open(os.path.join(gen_subdir, f"metrics_gen{gen_idx:02d}.json"), "w") as f:
+                    json.dump({"args": vars(args), "metrics": metrics}, f, indent=2)
                 save_image(target_img_tensor, os.path.join(save_dir, f"result_gen{gen_idx:02d}.png"))
 
-                # --- 即時評価 (On-the-fly Evaluation) ---
-                temp_evaluator = Evaluator(device)
-                vis_score, top1_idx, top1_prob = temp_evaluator.calc_visual_score(target_img_tensor, target_cls)
-                text_score, detected_text = temp_evaluator.calc_text_score(target_img_tensor, overlay_text)
-                ssim_val, lpips_val = temp_evaluator.calc_similarity(target_img_tensor, ref_clean_tensor)
-                del temp_evaluator
-                torch.cuda.empty_cache()
+                vis_score, top1_idx, top1_prob = evaluator.calc_visual_score(target_img_tensor, target_cls)
+                text_score, detected_text = evaluator.calc_text_score(target_img_tensor, overlay_text)
+                ssim_val, lpips_val = evaluator.calc_similarity(target_img_tensor, ref_clean_tensor)
 
-                # 結果記録
                 result_entry = {
+                    "dataset": args.dataset_type,
                     "exp_name": exp_name,
                     "class_id": target_cls,
                     "class_name": class_name,
                     "gen_idx": gen_idx,
                     "overlay_text": overlay_text,
-                    
-                    # Baseline (Clean)
                     "clean_visual_score": clean_vis_score,
                     "clean_text_score": clean_text_score,
-
-                    # Input (Attacked)
                     "attacked_visual_score": attacked_vis_score,
                     "attacked_text_score": attacked_text_score,
-                    
-                    # Output (Result)
                     "result_visual_score": vis_score,
                     "result_text_score": text_score,
-                    
-                    # Similarity
                     "ssim": ssim_val,
                     "lpips": lpips_val,
                     "detected_text": detected_text
                 }
                 evaluation_results.append(result_entry)
-                
-                logger.log(f"   [Eval][Gen{gen_idx}] Visual: {vis_score:.4f}, Text: {text_score:.4f}")
+                logger.log(f"   [Eval][{exp_name}][Gen{gen_idx}] Vis:{vis_score:.4f}, Text:{text_score:.4f}")
 
     global_pbar.close()
-    
-    # 評価結果の保存
-    import pandas as pd
-    df = pd.DataFrame(evaluation_results)
-    csv_path = os.path.join(args.output_dir, "final_evaluation.csv")
-    df.to_csv(csv_path, index=False)
-    logger.log(f"All experiments finished. Evaluation saved to {csv_path}")
+
+    if evaluation_results:
+        df = pd.DataFrame(evaluation_results)
+        csv_path = os.path.join(args.output_dir, f"final_evaluation_{args.dataset_type}.csv")
+        df.to_csv(csv_path, index=False)
+        logger.log(f"All experiments finished. Saved to {csv_path}")
+    else:
+        logger.log("No experiments ran. Check class_id_base, or dataset class labels.")
+
     logger.close()

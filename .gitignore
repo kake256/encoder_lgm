@@ -2,6 +2,7 @@
 
 # データセット関連
 Data/
+data/
 makeData/
 makeData_old/
 

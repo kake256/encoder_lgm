@@ -1,0 +1,12 @@
+Using GPU: NVIDIA GB10
+Initializing Evaluator...
+Loading Food-101 (Torchvision), root=/workspace/encoder_lgm/data ...
+Dataset Loaded: food101, Classes: 101
+Initializing Models...
+Preparing class: 49 (grilled_cheese_sandwich)
+[Debug] class=49, matched_indices=750
+[Debug] TV class=49, collected=50
+[49][Gen 0] Optimization Start.
+__PROGRESS__ Gen0 0/1 0.5148
+   [Eval][Gen0] Vis: 0.0003, Text: 0.0000
+All experiments finished. Saved to /workspace/encoder_lgm/classification_results/gene_experiment_4models_comparison/verify/final_evaluation_food101.csv
