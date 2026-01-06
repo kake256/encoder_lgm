@@ -1,5 +1,5 @@
 # =========================
-# main_genimg.py
+# main_genimg.py  (旧・安定版, 特徴保持なし)
 # =========================
 import os
 import sys
@@ -30,9 +30,6 @@ from optimized_model_utils import (
     EncoderClassifier,
     MultiModelGM,
     manage_model_allocation,
-    build_default_augmentor,
-    preprocess_imagenet,
-    infer_amp_dtype,
 )
 
 # ==============================================================================
@@ -225,10 +222,7 @@ class Evaluator:
             processed = self.resnet_transform(img_tensor)
             logits = self.resnet(processed)
             probs = F.softmax(logits, dim=1)
-            if target_class_idx < 1000:
-                score = probs[0, target_class_idx].item()
-            else:
-                score = 0.0
+            score = probs[0, target_class_idx].item() if target_class_idx < 1000 else 0.0
             top1_prob, top1_idx = torch.max(probs, dim=1)
         return score, top1_idx.item(), top1_prob.item()
 
@@ -265,7 +259,7 @@ class Evaluator:
 # Args, Dataset
 # ==============================================================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="Multi-Model LGM (Optimized)")
+    parser = argparse.ArgumentParser(description="Multi-Model LGM (Stable, No Cache)")
 
     parser.add_argument("--encoder_names", type=str, nargs="+", required=True)
     parser.add_argument("--projection_dims", type=int, nargs="+", default=[2048])
@@ -314,10 +308,7 @@ def load_dataset_by_type(args, logger):
     if args.dataset_type == "imagenet":
         logger.log("Loading ImageNet (Hugging Face)...")
         dataset = load_dataset("imagenet-1k", split="validation", streaming=bool(args.hf_streaming))
-        if args.hf_streaming:
-            class_names = [str(i) for i in range(1000)]
-        else:
-            class_names = dataset.features["label"].names
+        class_names = [str(i) for i in range(1000)] if args.hf_streaming else dataset.features["label"].names
         return dataset, class_names, "hf"
 
     if args.dataset_type == "food101":
@@ -392,40 +383,6 @@ def get_images_of_class_random_k(dataset, dataset_source_type, target_cls_idx, k
     return collected
 
 # ==============================================================================
-# NEW, class×gen 単位の real_feats 事前計算
-# ==============================================================================
-@torch.no_grad()
-def precompute_real_features_once_per_class_gen(
-    models_list,
-    real_images_pool,
-    args,
-    device,
-    amp_dtype,
-    logger=None,
-):
-    """
-    class と gen が固定の範囲で, real_feats を一回だけ計算して返す.
-    experiments 間で再利用する前提.
-    """
-    augmentor = build_default_augmentor(args)
-    indices = torch.randperm(len(real_images_pool))[:min(args.num_ref_images, len(real_images_pool))]
-    real_batch = real_images_pool[indices].detach()
-
-    aug_real = augmentor(real_batch)
-    inp_real = preprocess_imagenet(aug_real, device=device)
-
-    cached = [None] * len(models_list)
-    for i, model in enumerate(models_list):
-        # weights に依存させず, 全モデル分計算してしまう方が experiments 間共有が単純.
-        with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            feats = model.forward_features(inp_real)
-        cached[i] = feats.detach()
-
-    if logger is not None:
-        logger.log(f"[Cache] computed real_feats once, batch={inp_real.shape[0]}, amp_dtype={str(amp_dtype)}")
-    return cached
-
-# ==============================================================================
 # Main
 # ==============================================================================
 if __name__ == "__main__":
@@ -465,10 +422,6 @@ if __name__ == "__main__":
         m.to(device)
         m.eval()
         models_list.append(m)
-
-    # --- new, amp dtype を最初に確定して固定 ---
-    amp_dtype = infer_amp_dtype(device)
-    logger.log(f"[AMP] fixed amp_dtype={str(amp_dtype)}")
 
     total_steps = len(target_ids_to_run) * len(args.experiments) * args.num_generations * args.num_iterations
     global_pbar = tqdm(total=total_steps, unit="step", desc="Total Progress", position=0, dynamic_ncols=True)
@@ -525,36 +478,12 @@ if __name__ == "__main__":
         attacked_vis_score, _, _ = evaluator.calc_visual_score(ref_attacked_tensor, target_cls)
         attacked_text_score, _ = evaluator.calc_text_score(ref_attacked_tensor, overlay_text)
 
-        # experiments 前に共通出力dirだけ用意.
-        # （expごとに下に保存する設計は維持）
-        for exp_str in args.experiments:
-            exp_name, _ = exp_str.split(":")
-            save_dir = os.path.join(args.output_dir, f"{args.dataset_type}_{exp_name}", f"{target_cls}_{safe_cls_name}")
-            os.makedirs(save_dir, exist_ok=True)
-            save_image(real_images_pool[:min(16, real_images_pool.shape[0])],
-                       os.path.join(save_dir, "ref_pool.png"), nrow=4)
-
-        # --- gen loop ---
+        # gen loop
         for gen_idx in range(args.num_generations):
             current_seed = args.seed + gen_idx
             set_seed(current_seed)
 
-            # --- old ---
-            # exp ごとに MultiModelGM を作り, そのたびに precompute_real_features を呼んでいた.
-            # これだと experiments 数だけ real encoder forward が走る.
-
-            # --- new ---
-            # class×gen 単位で一度だけ real_feats を作り, experiments 間で再利用する.
-            cached_real_features = precompute_real_features_once_per_class_gen(
-                models_list=models_list,
-                real_images_pool=real_images_pool,
-                args=args,
-                device=device,
-                amp_dtype=amp_dtype,
-                logger=logger,
-            )
-
-            # --- experiments loop ---
+            # experiments loop, 旧版は共有しない.
             for exp_str in args.experiments:
                 exp_name, weights_str = exp_str.split(":")
                 weights = [float(w) for w in weights_str.split(",")]
@@ -565,6 +494,10 @@ if __name__ == "__main__":
                 gen_subdir = os.path.join(save_dir, f"gen_{gen_idx:02d}")
                 os.makedirs(gen_subdir, exist_ok=True)
 
+                # 参照プールも expごとに保存(旧版の挙動)
+                save_image(real_images_pool[:min(16, real_images_pool.shape[0])].detach().cpu(),
+                           os.path.join(save_dir, "ref_pool.png"), nrow=4)
+
                 lgm = MultiModelGM(
                     models=models_list,
                     model_weights=weights,
@@ -572,12 +505,10 @@ if __name__ == "__main__":
                     args=args,
                     device=device,
                     initial_image=None,
-                    cached_real_features=cached_real_features,
-                    amp_dtype=amp_dtype,
                 )
 
-                # --- old ---
-                # lgm.precompute_real_features(real_images_pool)
+                # 旧版, expごとに毎回 real feats を計算.
+                lgm.precompute_real_features(real_images_pool)
 
                 final_img, best_img, metrics = lgm.run(
                     real_images_pool,

@@ -29,7 +29,9 @@ COMMON_DATA_ROOT="$PROJECT_DIR/data"
 
 DATASET_TYPE="food101"
 DATA_ROOT="$COMMON_DATA_ROOT"
-TARGET_CLASSES="49 73 76 92"
+#TARGET_CLASSES="49 73 76 92"
+TARGET_CLASSES="9 11 12 15 29 36 37 43 46 48 51 56 67 71 72 75 84 86 88 89"
+
 
 # Food101 が 1-index 指定なら 1 にする
 CLASS_ID_BASE=0
@@ -48,10 +50,24 @@ ENCODER_NAMES=(
 PROJ_DIM_LIST=("0 0 0 0")
 
 EXPERIMENTS=(
-  "Only_V1:1.0,0.0,0.0,0.0"
-  "Only_V2:0.0,1.0,0.0,0.0"
-  "Only_CLIP:0.0,0.0,1.0,0.0"
-  "Only_SigLIP:0.0,0.0,0.0,1.0"
+  # --- 単体モデル (基準用) ---
+  #"Only_V1:1.0,0.0,0.0,0.0"
+  #"Only_V2:0.0,1.0,0.0,0.0"
+  #"Only_CLIP:0.0,0.0,1.0,0.0"
+  #"Only_SigLIP:0.0,0.0,0.0,1.0"
+
+  # --- マルチモデル (2モデルの組み合わせ 全6種) ---
+  # 1. 同系統の組み合わせ (DINO同士 / 言語系同士)
+  "Hybrid_V1_V2:1.0,1.0,0.0,0.0"
+  "Hybrid_CLIP_SigLIP:0.0,0.0,1.0,1.0"
+
+  # 2. DINOv1 とのハイブリッド
+  "Hybrid_V1_CLIP:1.0,0.0,1.0,0.0"
+  "Hybrid_V1_SigLIP:1.0,0.0,0.0,1.0"
+
+  # 3. DINOv2 とのハイブリッド
+  "Hybrid_V2_CLIP:0.0,1.0,1.0,0.0"
+  "Hybrid_V2_SigLIP:0.0,1.0,0.0,1.0"
 )
 
 ITERATIONS=4000
@@ -71,7 +87,7 @@ PYRAMID_START_RES=4
 # ========================================================
 # 4. 並列実行設定
 # ========================================================
-MAX_JOBS=4
+MAX_JOBS=2
 NUM_GPUS=1
 
 # ========================================================

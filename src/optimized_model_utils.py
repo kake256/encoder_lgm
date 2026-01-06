@@ -1,11 +1,12 @@
 # =========================
-# optimized_model_utils.py
+# optimized_model_utils.py  (旧・安定版, 特徴保持なし)
 # =========================
 import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 import torchvision.transforms as T
 from torchvision.utils import save_image
 from transformers import CLIPVisionModel, Dinov2Model, ViTModel, SiglipVisionModel
@@ -17,41 +18,7 @@ except ImportError:
     timm = None
     print("Warning, 'timm' library not found. DINOv3 or timm-based models cannot be loaded automatically.")
 
-# ==============================================================================
-# Common helpers, preprocessing, augmentation
-# ==============================================================================
-def preprocess_imagenet(img, device):
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-    return (img - mean) / std
 
-def build_default_augmentor(args):
-    return T.Compose([
-        T.RandomResizedCrop(args.image_size, scale=(args.min_scale, args.max_scale), antialias=True),
-        T.RandomHorizontalFlip(p=0.5),
-        T.RandomAffine(degrees=10, translate=(0.1, 0.1)),
-        T.ColorJitter(0.1, 0.1, 0.1, 0.05),
-        RandomGaussianNoise(mean=0.0, std=args.noise_std, p=args.noise_prob),
-    ])
-
-def infer_amp_dtype(device):
-    """
-    amp dtype を一度だけ確定して返す.
-    bf16 が使えるなら bf16, そうでなければ fp16.
-    """
-    if device.type != "cuda":
-        return torch.float32
-    # bf16 がネイティブに使えるか.
-    try:
-        if torch.cuda.is_bf16_supported():
-            return torch.bfloat16
-    except Exception:
-        pass
-    return torch.float16
-
-# ==============================================================================
-# GPU allocation
-# ==============================================================================
 def manage_model_allocation(models, weights, device):
     for i, model in enumerate(models):
         if weights[i] > 0:
@@ -61,9 +28,7 @@ def manage_model_allocation(models, weights, device):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-# ==============================================================================
-# Losses, noise
-# ==============================================================================
+
 class RandomGaussianNoise(nn.Module):
     def __init__(self, mean=0.0, std=1.0, p=0.5):
         super().__init__()
@@ -72,15 +37,11 @@ class RandomGaussianNoise(nn.Module):
         self.p = p
 
     def forward(self, images):
-        # --- old (probability logic inverted) ---
-        # if torch.rand(1).item() < self.p:
-        #     return images
-
-        # --- new (apply noise with probability p) ---
         if torch.rand(1).item() >= self.p:
             return images
         noise = torch.randn_like(images) * self.std + self.mean
         return images + noise
+
 
 class TVLoss(nn.Module):
     def forward(self, img):
@@ -89,9 +50,7 @@ class TVLoss(nn.Module):
         w_tv = torch.pow((img[:, :, :, 1:] - img[:, :, :, :w-1]), 2).mean()
         return h_tv + w_tv
 
-# ==============================================================================
-# EncoderClassifier
-# ==============================================================================
+
 class EncoderClassifier(nn.Module):
     def __init__(
         self,
@@ -183,6 +142,7 @@ class EncoderClassifier(nn.Module):
             if self.feature_source == "mean":
                 return outputs.last_hidden_state.mean(dim=1)
             return outputs.last_hidden_state[:, 0, :]
+
         if self.encoder_model_name.startswith("openai/clip"):
             if self.feature_source == "pooler":
                 return outputs.pooler_output
@@ -190,6 +150,7 @@ class EncoderClassifier(nn.Module):
                 return outputs.last_hidden_state[:, 0, :]
             if self.feature_source == "mean":
                 return outputs.last_hidden_state[:, 1:, :].mean(dim=1)
+
         if "dino" in self.encoder_model_name:
             if self.feature_source == "cls":
                 return outputs.last_hidden_state[:, 0, :]
@@ -215,9 +176,7 @@ class EncoderClassifier(nn.Module):
     def forward(self, x):
         return self.forward_head(self.forward_features(x))
 
-# ==============================================================================
-# PyramidGenerator
-# ==============================================================================
+
 class PyramidGenerator(nn.Module):
     def __init__(self, target_size=224, start_size=16, activation="sigmoid", initial_image=None, noise_level=0.0):
         super().__init__()
@@ -299,21 +258,9 @@ class PyramidGenerator(nn.Module):
             return torch.sigmoid(2 * image)
         return image
 
-# ==============================================================================
-# MultiModelGM, with fixed AMP dtype, and external real_feats cache injection
-# ==============================================================================
+
 class MultiModelGM:
-    def __init__(
-        self,
-        models,
-        model_weights,
-        target_class,
-        args,
-        device,
-        initial_image=None,
-        cached_real_features=None,
-        amp_dtype=None,
-    ):
+    def __init__(self, models, model_weights, target_class, args, device, initial_image=None):
         self.models = models
         self.model_weights = model_weights
         self.target_class = target_class
@@ -329,34 +276,27 @@ class MultiModelGM:
         ).to(device)
 
         self.optimizer = self._init_optimizer()
-        self.augmentor = build_default_augmentor(args)
+        self.augmentor = T.Compose([
+            T.RandomResizedCrop(args.image_size, scale=(args.min_scale, args.max_scale), antialias=True),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+            T.ColorJitter(0.1, 0.1, 0.1, 0.05),
+            RandomGaussianNoise(mean=0.0, std=args.noise_std, p=args.noise_prob),
+        ])
 
-        self.amp_dtype = amp_dtype if amp_dtype is not None else infer_amp_dtype(device)
-
-        # --- old ---
-        # self.scaler = torch.cuda.amp.GradScaler()
-
-        # --- new ---
-        # fp16 だけ GradScaler を使う, bf16 はスケーラ不要.
-        if device.type == "cuda" and self.amp_dtype == torch.float16:
-            self.scaler = torch.amp.GradScaler("cuda")
-        else:
-            self.scaler = None
-
+        self.scaler = torch.amp.GradScaler("cuda") if torch.cuda.is_available() else None
         self.tv_loss_fn = TVLoss().to(device)
 
-        # --- old ---
-        # self.cached_real_features = [None] * len(models)
-
-        # --- new ---
-        # 外部から与えられたキャッシュを優先し, なければ従来どおり自前で埋める.
-        self.cached_real_features = cached_real_features if cached_real_features is not None else [None] * len(models)
+        # 旧版, experimentごとに毎回計算して保持する.
+        self.cached_real_features = [None] * len(models)
 
     def _init_optimizer(self):
         return optim.Adam(self.generator.parameters(), lr=self.args.lr)
 
     def preprocess(self, img):
-        return preprocess_imagenet(img, device=self.device)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+        return (img - mean) / std
 
     def get_grads_from_features(self, model, features, create_graph=False):
         params = list(model.classifier.parameters())
@@ -368,10 +308,6 @@ class MultiModelGM:
         return flat_grad
 
     def precompute_real_features(self, real_images_pool):
-        """
-        互換のため残す.
-        ただし, main 側で cached_real_features を与える運用では呼ばれない.
-        """
         indices = torch.randperm(len(real_images_pool))[:min(self.args.num_ref_images, len(real_images_pool))]
         real_batch = real_images_pool[indices].detach()
 
@@ -383,8 +319,13 @@ class MultiModelGM:
                 continue
 
             with torch.no_grad():
-                with torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=(self.device.type == "cuda")):
-                    feats = model.forward_features(inp_real)
+                try:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        feats = model.forward_features(inp_real)
+                except Exception:
+                    with autocast():
+                        feats = model.forward_features(inp_real)
+
             self.cached_real_features[i] = feats.detach()
 
     def optimize_step(self, _unused):
@@ -410,24 +351,16 @@ class MultiModelGM:
             if real_feats is None:
                 continue
 
-            # --- old ---
-            # try:
-            #     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            #         target_grad = self.get_grads_from_features(model, real_feats, create_graph=False)
-            #         syn_feats = model.forward_features(inp_syn)
-            #         syn_grad = self.get_grads_from_features(model, syn_feats, create_graph=True)
-            # except Exception:
-            #     with torch.cuda.amp.autocast():
-            #         target_grad = self.get_grads_from_features(model, real_feats, create_graph=False)
-            #         syn_feats = model.forward_features(inp_syn)
-            #         syn_grad = self.get_grads_from_features(model, syn_feats, create_graph=True)
-
-            # --- new ---
-            # AMP dtype を固定し, stepごとの try/except を排除.
-            with torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=(self.device.type == "cuda")):
-                target_grad = self.get_grads_from_features(model, real_feats, create_graph=False)
-                syn_feats = model.forward_features(inp_syn)
-                syn_grad = self.get_grads_from_features(model, syn_feats, create_graph=True)
+            try:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    target_grad = self.get_grads_from_features(model, real_feats, create_graph=False)
+                    syn_feats = model.forward_features(inp_syn)
+                    syn_grad = self.get_grads_from_features(model, syn_feats, create_graph=True)
+            except Exception:
+                with autocast():
+                    target_grad = self.get_grads_from_features(model, real_feats, create_graph=False)
+                    syn_feats = model.forward_features(inp_syn)
+                    syn_grad = self.get_grads_from_features(model, syn_feats, create_graph=True)
 
             sim = F.cosine_similarity(target_grad.unsqueeze(0).detach(), syn_grad.unsqueeze(0)).mean()
             loss_k = 1.0 - sim
@@ -482,7 +415,6 @@ class MultiModelGM:
             local_pbar.set_description(f"G{gen_idx} L:{l_grad:.3f} R:{self.generator.levels[-1].shape[-1]}")
             global_pbar.update(1)
 
-            # save間隔はユーザー指定により変更しない.
             if i % 500 == 0:
                 with torch.no_grad():
                     save_image(self.generator().detach().cpu(),
