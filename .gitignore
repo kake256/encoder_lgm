@@ -2,8 +2,11 @@
 
 # データセット関連
 Data/
+data/
 makeData/
+makeData_midmid/
 makeData_old/
+
 
 # 結果・出力・ログ関連
 classification_results/
@@ -16,6 +19,7 @@ weights/
 
 # その他・バックアップ
 old/
+old_scripts/
 
 # --- 一般的なシステムファイルやキャッシュ (念のため追加推奨) ---
 .DS_Store
