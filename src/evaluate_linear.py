@@ -2,6 +2,7 @@ import os
 import argparse
 import random
 import re
+import json
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -17,12 +18,12 @@ from scipy.stats import spearmanr
 
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
-from sklearn.linear_model import LogisticRegression
 from sklearn.manifold import TSNE
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, accuracy_score
 
 from datasets import load_dataset
 from transformers import AutoModel, AutoProcessor, CLIPModel, CLIPProcessor, ResNetModel
@@ -66,9 +67,29 @@ IMG_SIZE = 224
 MAX_REAL_TRAIN = 50
 MAX_REAL_TEST = 50
 
+# PyTorch Linear Probe Settings (L-BFGS Defaults)
+# L-BFGS typically works well with lr=1.0 and few steps
+PROBE_CONFIG = {
+    "epochs": 20,      # L-BFGS steps (each step has internal iterations)
+    "lr": 1.0,         # Standard LR for L-BFGS
+    "history_size": 100
+}
+
 # ========================================================
 # 2. Utilities.
 # ========================================================
+def load_probe_config(config_path):
+    global PROBE_CONFIG
+    if config_path and os.path.exists(config_path):
+        print(f"Loading probe config from: {config_path}")
+        try:
+            with open(config_path, 'r') as f:
+                loaded_cfg = json.load(f)
+                PROBE_CONFIG.update(loaded_cfg)
+        except Exception as e:
+            print(f"Error loading config file: {e}. Using defaults.")
+    print(f"Probe Config: {PROBE_CONFIG}")
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -90,9 +111,6 @@ class AddGaussianNoise(object):
 
     def __call__(self, tensor):
         return tensor + torch.randn(tensor.size()) * self.std + self.mean
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}(mean={self.mean}, std={self.std})"
 
 class CustomImageDataset(Dataset):
     def __init__(self, image_paths, labels, transform):
@@ -122,6 +140,17 @@ class PilImageDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.transform(self.images[idx]), self.labels[idx]
+
+class TensorDataset(Dataset):
+    def __init__(self, features, labels):
+        self.features = torch.from_numpy(features).float()
+        self.labels = torch.from_numpy(labels).long()
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx]
 
 # ========================================================
 # 3. Real data loaders.
@@ -183,30 +212,8 @@ def load_cub_real_data_local(data_root, target_class_map, split="train", max_per
         else:
             real_norm_to_folder[norm_name(rf)] = rf
 
-    split_map = {}
-    split_file = root / "train_test_split.txt"
-    images_file = root / "images.txt"
-    use_official_split = split_file.exists() and images_file.exists()
-
-    path_to_id = {}
-    if use_official_split:
-        print(f"Loading CUB official split from {split_file}...")
-        with open(images_file, "r") as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    path_to_id[parts[1]] = parts[0]
-        with open(split_file, "r") as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    split_map[parts[0]] = int(parts[1])
-
     collected_imgs, collected_lbls = [], []
     print(f"Collecting CUB images (LOCAL) for [{split}] (Max {max_per_class}/class)...")
-
-    matched_count, total_loaded = 0, 0
-    debug_misses = []
 
     for class_name, class_idx in tqdm(target_class_map.items(), desc="Loading Classes"):
         target_real_folder = None
@@ -214,6 +221,7 @@ def load_cub_real_data_local(data_root, target_class_map, split="train", max_per
         if m:
             cid = int(m.group(1))
             target_real_folder = real_id_to_folder.get(cid)
+
         if not target_real_folder:
             name_part = class_name
             if "_" in class_name: name_part = class_name.split("_", 1)[1]
@@ -221,124 +229,65 @@ def load_cub_real_data_local(data_root, target_class_map, split="train", max_per
             key = norm_name(name_part)
             target_real_folder = real_norm_to_folder.get(key)
 
-        if not target_real_folder:
-            debug_misses.append(class_name)
-            continue
+        if not target_real_folder: continue
 
-        matched_count += 1
         class_dir = images_dir / target_real_folder
         img_files = sorted(list(class_dir.glob("*.jpg")))
-        if len(img_files) == 0: continue
-
+        
         count = 0
         for img_path in img_files:
             if count >= max_per_class: break
-            is_target_split = True
-            if use_official_split:
-                rel_path = f"{target_real_folder}/{img_path.name}"
-                if rel_path in path_to_id:
-                    img_id = path_to_id[rel_path]
-                    if img_id in split_map:
-                        is_train_flag = (split_map[img_id] == 1)
-                        if split == "train" and not is_train_flag: is_target_split = False
-                        if split in ["validation", "test"] and is_train_flag: is_target_split = False
-                    else: is_target_split = False
-                else: is_target_split = False
-            else:
-                threshold = int(len(img_files) * 0.8)
-                idx = img_files.index(img_path)
-                if split == "train" and idx >= threshold: is_target_split = False
-                if split in ["validation", "test"] and idx < threshold: is_target_split = False
-
-            if is_target_split:
+            
+            threshold = int(len(img_files) * 0.8)
+            idx = img_files.index(img_path)
+            is_target = (split == "train" and idx < threshold) or (split != "train" and idx >= threshold)
+            
+            if is_target:
                 try:
                     img = Image.open(img_path).convert("RGB")
                     collected_imgs.append(img)
                     collected_lbls.append(class_idx)
                     count += 1
-                except Exception as e:
-                    print(f"Error loading {img_path}. Error: {e}")
-        total_loaded += count
+                except: pass
 
-    if matched_count == 0:
-        print("\n[CRITICAL ERROR] No matching class folders found in LOCAL loader.")
-        if debug_misses: print(f"Miss examples: {debug_misses[:10]}")
-    elif total_loaded == 0:
-        print(f"\n[WARNING] Classes matched ({matched_count}) but 0 images loaded.")
-    else:
-        print(f"[CUB LOCAL] Matched classes: {matched_count}, Loaded images: {total_loaded}")
     return collected_imgs, collected_lbls
 
 def _infer_label_id_map_from_hf(ds, synthetic_class_map, dataset_name_tag="Dataset"):
     label_col = "label"
     if label_col not in ds.features:
-        for candidate in ["fine_label", "coarse_label", "labels"]:
-            if candidate in ds.features:
-                label_col = candidate
-                break
+        for c in ["fine_label", "coarse_label", "labels"]:
+            if c in ds.features: label_col = c; break
     if label_col not in ds.features:
         raise ValueError(f"HF dataset has no label feature. Available: {list(ds.features.keys())}")
 
     label_feature = ds.features[label_col]
-    hf_names = None
-    if hasattr(label_feature, "names") and label_feature.names is not None:
-        hf_names = list(label_feature.names)
-
-    num_labels = None
-    if hf_names is not None:
-        num_labels = len(hf_names)
-    else:
-        try: num_labels = int(ds[label_col].max()) + 1
-        except Exception: num_labels = None
-
-    hf_norm_to_id = {}
-    if hf_names is not None:
-        for i, n in enumerate(hf_names):
-            hf_norm_to_id[norm_name(n)] = i
+    hf_names = list(label_feature.names) if hasattr(label_feature, "names") else None
+    num_labels = len(hf_names) if hf_names else int(ds[label_col].max()) + 1
+    hf_norm_to_id = {norm_name(n): i for i, n in enumerate(hf_names)} if hf_names else {}
 
     syn_internal_to_hf_label = {}
-    misses = []
     for syn_class_name, internal_idx in synthetic_class_map.items():
         hf_id = None
         m = re.match(r"^(\d+)", syn_class_name)
-        if m and num_labels is not None:
-            cid = int(m.group(1))
-            candidate = cid - 1
-            if 0 <= candidate < num_labels:
-                hf_id = candidate
+        if m and 0 <= int(m.group(1))-1 < num_labels:
+            hf_id = int(m.group(1))-1 
+        
         if hf_id is None and hf_norm_to_id:
             name_part = syn_class_name
-            if "_" in syn_class_name and m:
-                parts = re.split(r"[._]", syn_class_name, 1)
-                if len(parts) > 1: name_part = parts[1]
-            elif "." in syn_class_name and m:
-                parts = syn_class_name.split(".", 1)
-                if len(parts) > 1: name_part = parts[1]
+            if "_" in syn_class_name and m: name_part = re.split(r"[._]", syn_class_name, 1)[1]
+            elif "." in syn_class_name and m: name_part = syn_class_name.split(".", 1)[1]
             key = norm_name(name_part)
             hf_id = hf_norm_to_id.get(key)
-        
-        if hf_id is None:
-            misses.append(syn_class_name)
-            continue
-        syn_internal_to_hf_label[internal_idx] = hf_id
 
-    if len(syn_internal_to_hf_label) == 0:
-        raise RuntimeError(f"Failed to map any synthetic classes. Example: {list(synthetic_class_map.keys())[:5]}")
-    if misses:
-        print(f"[{dataset_name_tag} HF] Unmapped synthetic classes (examples): {misses[:10]}")
+        if hf_id is not None:
+            syn_internal_to_hf_label[internal_idx] = hf_id
+
     return syn_internal_to_hf_label, label_col
 
 def load_real_data_hf_generic(hf_dataset, split, synthetic_class_map, max_per_class, seed=42, dataset_name_tag="Dataset"):
     print(f"Loading {dataset_name_tag} from HF. dataset={hf_dataset}, split={split}")
-    try:
-        ds = load_dataset(hf_dataset, split=split)
-    except Exception as e:
-        print(f"Standard load failed: {e}. Retrying with trust_remote_code=True...")
-        try: ds = load_dataset(hf_dataset, split=split, trust_remote_code=True)
-        except Exception as e2: raise RuntimeError(f"Failed to load {hf_dataset}: {e2}")
-
-    if "image" not in ds.features:
-        raise ValueError(f"HF dataset has no 'image' feature.")
+    try: ds = load_dataset(hf_dataset, split=split)
+    except: ds = load_dataset(hf_dataset, split=split, trust_remote_code=True)
 
     internal_to_hf, label_col = _infer_label_id_map_from_hf(ds, synthetic_class_map, dataset_name_tag)
     hf_to_internal = {v: k for k, v in internal_to_hf.items()}
@@ -347,30 +296,20 @@ def load_real_data_hf_generic(hf_dataset, split, synthetic_class_map, max_per_cl
     indices = list(range(len(ds)))
     rng.shuffle(indices)
 
-    counts = {internal_idx: 0 for internal_idx in internal_to_hf.keys()}
+    counts = {k: 0 for k in internal_to_hf.keys()}
     images, labels = [], []
 
     for idx in indices:
         item = ds[idx]
-        hf_lbl = int(item[label_col])
-        internal = hf_to_internal.get(hf_lbl, None)
-        if internal is None: continue
-        if counts[internal] >= max_per_class: continue
-
+        internal = hf_to_internal.get(int(item[label_col]))
+        if internal is None or counts[internal] >= max_per_class: continue
         img = item["image"]
-        if not isinstance(img, Image.Image):
-            try: img = Image.fromarray(np.array(img)).convert("RGB")
-            except Exception: continue
+        if not isinstance(img, Image.Image): img = Image.fromarray(np.array(img)).convert("RGB")
         else: img = img.convert("RGB")
         images.append(img)
         labels.append(internal)
         counts[internal] += 1
         if all(c >= max_per_class for c in counts.values()): break
-
-    total = len(images)
-    matched_classes = sum(1 for c in counts.values() if c > 0)
-    print(f"[{dataset_name_tag} HF] Matched classes: {matched_classes}/{len(counts)}, Loaded images: {total}")
-    if total == 0: raise RuntimeError(f"Loaded 0 images from HF ({dataset_name_tag}).")
     return images, labels
 
 def get_fewshot_subset(imgs, lbls, shots_per_class):
@@ -385,7 +324,7 @@ def get_fewshot_subset(imgs, lbls, shots_per_class):
     return subset_imgs, subset_lbls
 
 # ========================================================
-# 4. Feature extractor.
+# 4. Feature extractor & Linear Probe
 # ========================================================
 class FeatureExtractor(nn.Module):
     def __init__(self, model_name):
@@ -421,10 +360,6 @@ class FeatureExtractor(nn.Module):
                     T.ColorJitter(0.1, 0.1, 0.1, 0.05),
                 ])
                 image = aug_pil(image)
-                inputs = self.processor(images=image, return_tensors="pt")
-                pixel_values = inputs["pixel_values"].squeeze(0)
-                pixel_values = AddGaussianNoise(mean=0.0, std=0.05)(pixel_values)
-                return pixel_values
             inputs = self.processor(images=image, return_tensors="pt")
             return inputs["pixel_values"].squeeze(0)
         return transform
@@ -450,6 +385,65 @@ def extract_features_and_labels(model, dataloader):
         lbls.append(labels.numpy())
     if not feats: return None, None
     return np.concatenate(feats), np.concatenate(lbls)
+
+class LinearProbe(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        self.fc = nn.Linear(input_dim, num_classes)
+    
+    def forward(self, x):
+        return self.fc(x)
+
+def train_linear_probe_and_track_loss(X_train, y_train, num_classes, epochs=None):
+    """
+    Train using Full-Batch L-BFGS to replicate sklearn-like convergence
+    while tracking loss history.
+    """
+    # Override epochs with config if not passed
+    n_epochs = epochs if epochs is not None else PROBE_CONFIG["epochs"]
+    
+    # Move all data to GPU (Full Batch)
+    X_tensor = torch.from_numpy(X_train).float().to(DEVICE)
+    y_tensor = torch.from_numpy(y_train).long().to(DEVICE)
+    
+    input_dim = X_train.shape[1]
+    model = LinearProbe(input_dim, num_classes).to(DEVICE)
+    
+    criterion = nn.CrossEntropyLoss()
+    
+    # L-BFGS Optimizer
+    optimizer = optim.LBFGS(model.parameters(), 
+                            lr=PROBE_CONFIG["lr"], 
+                            max_iter=20, 
+                            history_size=PROBE_CONFIG.get("history_size", 100))
+    
+    loss_history = []
+    model.train()
+    
+    def closure():
+        optimizer.zero_grad()
+        outputs = model(X_tensor)
+        loss = criterion(outputs, y_tensor)
+        loss.backward()
+        return loss
+
+    # print(f"  [L-BFGS] Start training for {n_epochs} steps...")
+    
+    for epoch in range(n_epochs):
+        # Optimizer step (performs multiple internal iterations)
+        loss = optimizer.step(closure)
+        
+        current_loss = loss.item()
+        loss_history.append(current_loss)
+        
+        # Early stopping check (if loss stabilizes)
+        if epoch > 5 and abs(loss_history[-2] - loss_history[-1]) < 1e-6:
+            # print(f"    Converged at step {epoch}")
+            # Fill remaining history for plotting consistency
+            loss_history.extend([current_loss] * (n_epochs - epoch - 1))
+            break
+            
+    return model, loss_history
 
 # ========================================================
 # 5. Visualization, evaluation.
@@ -505,15 +499,29 @@ def visualize_tsne(features_dict, labels_dict, title, save_path, class_names_map
     plt.savefig(save_path)
     plt.close()
 
-def evaluate_per_class(clf, X_test, y_test, id_to_class_name, generator_name, evaluator_name, output_dir):
-    y_pred = clf.predict(X_test)
-    overall_acc = clf.score(X_test, y_test)
+def evaluate_per_class(model, X_test, y_test, id_to_class_name, generator_name, evaluator_name, output_dir):
+    model.eval()
+    test_dataset = TensorDataset(X_test, y_test)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for inputs, targets in test_loader:
+            inputs = inputs.to(DEVICE)
+            outputs = model(inputs)
+            preds = torch.argmax(outputs, dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_targets.extend(targets.numpy())
+            
+    y_pred = np.array(all_preds)
+    y_true = np.array(all_targets)
+    overall_acc = accuracy_score(y_true, y_pred)
 
     # CM Save
     cm_dir = os.path.join(output_dir, "confusion_matrices")
     os.makedirs(cm_dir, exist_ok=True)
     unique_classes_all = sorted(list(id_to_class_name.keys()))
-    cm = confusion_matrix(y_test, y_pred, labels=unique_classes_all)
+    cm = confusion_matrix(y_true, y_pred, labels=unique_classes_all)
     
     cm_cols = [id_to_class_name.get(i, str(i)) for i in unique_classes_all]
     cm_df = pd.DataFrame(cm, index=cm_cols, columns=cm_cols)
@@ -521,14 +529,14 @@ def evaluate_per_class(clf, X_test, y_test, id_to_class_name, generator_name, ev
     cm_df.to_csv(cm_path)
 
     results = []
-    unique_classes = sorted(np.unique(y_test))
+    unique_classes = sorted(np.unique(y_true))
     acc_map = {}
     for cls_id in unique_classes:
-        mask = (y_test == cls_id)
+        mask = (y_true == cls_id)
         if np.sum(mask) == 0:
             acc_map[cls_id] = 0.0
             continue
-        cls_acc = (y_pred[mask] == y_test[mask]).mean()
+        cls_acc = (y_pred[mask] == y_true[mask]).mean()
         acc_map[cls_id] = float(cls_acc)
         cls_name = id_to_class_name.get(int(cls_id), str(cls_id))
         results.append({
@@ -543,11 +551,9 @@ def evaluate_per_class(clf, X_test, y_test, id_to_class_name, generator_name, ev
 
 def calculate_complex_correlations(acc_store, experiments, output_dir):
     results = []
-    if "Real_Baseline" not in acc_store.get(STANDARD_EVALUATOR, {}):
-        print(f"[Warning] {STANDARD_EVALUATOR} evaluated on Real_Baseline is missing. Skipping Policy A.")
+    if "Real_Baseline" not in acc_store.get(STANDARD_EVALUATOR, {}): return
     for gen_name in experiments.keys():
         source_models = GENERATOR_SOURCE_MAP.get(gen_name, [])
-        if not source_models: continue
         for source_model in source_models:
             if source_model not in acc_store: continue
             vec_resnet_syn = acc_store[STANDARD_EVALUATOR].get(gen_name)
@@ -555,24 +561,16 @@ def calculate_complex_correlations(acc_store, experiments, output_dir):
             vec_source_syn = acc_store[source_model].get(gen_name)
             vec_source_real = acc_store[source_model].get("Real_Baseline")
 
-            if vec_resnet_syn is None: continue
             row = {"Generator": gen_name, "Target_Source_Model": source_model}
-            if vec_resnet_real is not None:
+            if vec_resnet_syn is not None and vec_resnet_real is not None:
                 corr, _ = spearmanr(vec_resnet_syn, vec_resnet_real)
                 row["Policy_A (ResNet_Syn vs ResNet_Real)"] = float(corr)
-            else: row["Policy_A (ResNet_Syn vs ResNet_Real)"] = None
             if vec_source_syn is not None and vec_source_real is not None:
                 corr, _ = spearmanr(vec_source_syn, vec_source_real)
                 row["Policy_D (Source_Syn vs Source_Real)"] = float(corr)
-            else: row["Policy_D (Source_Syn vs Source_Real)"] = None
             results.append(row)
     if results:
-        df = pd.DataFrame(results)
-        cols = ["Generator", "Target_Source_Model", "Policy_A (ResNet_Syn vs ResNet_Real)", "Policy_D (Source_Syn vs Source_Real)"]
-        df = df[[c for c in cols if c in df.columns]]
-        save_path = os.path.join(output_dir, "complex_correlation_policies.csv")
-        df.to_csv(save_path, index=False)
-        print(f"\n[Success] Policy 1 (Difficulty Alignment) saved to: {save_path}")
+        pd.DataFrame(results).to_csv(os.path.join(output_dir, "complex_correlation_policies.csv"), index=False)
 
 def calculate_self_preference(final_results, output_dir):
     df = pd.DataFrame(final_results)
@@ -581,7 +579,6 @@ def calculate_self_preference(final_results, output_dir):
     preference_results = []
     for gen_name in piv.index:
         source_models = GENERATOR_SOURCE_MAP.get(gen_name, [])
-        if not source_models: continue
         for source_model in source_models:
             if source_model not in piv.columns: continue
             self_score = piv.loc[gen_name, source_model]
@@ -597,31 +594,27 @@ def calculate_self_preference(final_results, output_dir):
                 "Self_Preference_Gap": gap
             })
     if preference_results:
-        pref_df = pd.DataFrame(preference_results)
-        save_path = os.path.join(output_dir, "self_preference_policy.csv")
-        pref_df.to_csv(save_path, index=False)
-        print(f"\n[Success] Policy 2 (Self-Preference Gap) saved to: {save_path}")
+        pd.DataFrame(preference_results).to_csv(os.path.join(output_dir, "self_preference_policy.csv"), index=False)
 
 def calculate_confusion_matrix_similarity(cm_store, experiments, output_dir):
-    results = []
-    for eval_name, gen_cms in cm_store.items():
-        if "Real_Baseline" not in gen_cms: continue
-        cm_real_baseline = gen_cms["Real_Baseline"].flatten()
+    generators = list(cm_store[STANDARD_EVALUATOR].keys())
+    sim_matrix_data = []
+    
+    for gen1 in generators:
+        row = {"Generator": gen1}
+        cm1 = cm_store[STANDARD_EVALUATOR][gen1].flatten()
+        norm1 = np.linalg.norm(cm1)
+        for gen2 in generators:
+            cm2 = cm_store[STANDARD_EVALUATOR][gen2].flatten()
+            norm2 = np.linalg.norm(cm2)
+            if norm1 > 0 and norm2 > 0: sim = np.dot(cm1, cm2) / (norm1 * norm2)
+            else: sim = 0.0
+            row[gen2] = sim
+        sim_matrix_data.append(row)
         
-        for gen_name in experiments.keys():
-            if gen_name not in gen_cms: continue
-            cm_syn = gen_cms[gen_name].flatten()
-            if np.linalg.norm(cm_syn) > 0 and np.linalg.norm(cm_real_baseline) > 0:
-                sim_baseline = np.dot(cm_syn, cm_real_baseline) / (np.linalg.norm(cm_syn) * np.linalg.norm(cm_real_baseline))
-            else:
-                sim_baseline = 0.0
-            results.append({
-                "Evaluator": eval_name,
-                "Generator": gen_name,
-                "Comparison": "vs_Real_Baseline",
-                "Cosine_Similarity": sim_baseline
-            })
-            
+    pd.DataFrame(sim_matrix_data).to_csv(os.path.join(output_dir, "confusion_matrix_similarity_matrix.csv"), index=False)
+    print(f"\n[Success] CM Similarity Matrix saved.")
+
     policy_results = []
     for gen_name in experiments.keys():
         source_models = GENERATOR_SOURCE_MAP.get(gen_name, [])
@@ -639,25 +632,38 @@ def calculate_confusion_matrix_similarity(cm_store, experiments, output_dir):
                         "Target_Source_Model": source_model,
                         "Policy_3 (Error_Consistency_Source_View)": sim
                     })
-
-    if results:
-        df_sim = pd.DataFrame(results)
-        df_pivot = df_sim.pivot(index="Generator", columns="Evaluator", values="Cosine_Similarity")
-        df_pivot.to_csv(os.path.join(output_dir, "confusion_matrix_similarity_baseline.csv"))
-        print(f"\n[Success] General CM Similarity saved to: confusion_matrix_similarity_baseline.csv")
     if policy_results:
-        df_policy = pd.DataFrame(policy_results)
-        df_policy.to_csv(os.path.join(output_dir, "confusion_matrix_policy_consistency.csv"), index=False)
-        print(f"\n[Success] Policy 3 (Error Consistency) saved to: confusion_matrix_policy_consistency.csv")
+        pd.DataFrame(policy_results).to_csv(os.path.join(output_dir, "confusion_matrix_policy_consistency.csv"), index=False)
+
+def save_loss_metrics(loss_store, output_dir):
+    df_history = pd.DataFrame(loss_store)
+    df_history.index.name = "Step"
+    df_history.to_csv(os.path.join(output_dir, "training_loss_history.csv"))
+    
+    metrics = []
+    for gen_name, losses in loss_store.items():
+        initial = losses[0]
+        final = losses[-1]
+        decay = initial - final
+        slope_5 = (losses[0] - losses[min(4, len(losses)-1)])
+        metrics.append({
+            "Generator": gen_name,
+            "Initial_Loss": initial,
+            "Final_Loss": final,
+            "Total_Drop": decay,
+            "Early_Drop_Slope": slope_5
+        })
+    pd.DataFrame(metrics).to_csv(os.path.join(output_dir, "learning_efficiency_metrics.csv"), index=False)
+    print("\n[Success] Loss history and metrics saved.")
 
 # ========================================================
 # 6. Main.
 # ========================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("dataset_dir", type=str, help="Path to synthetic dataset")
+    parser.add_argument("dataset_dir", type=str)
     parser.add_argument("--output_dir", type=str, default="evaluation_results_critique")
-    parser.add_argument("--augment", action="store_true", help="Enable data augmentation")
+    parser.add_argument("--augment", action="store_true")
     parser.add_argument("--dataset_type", type=str, default="imagenet", choices=["imagenet", "cub", "food101"])
     parser.add_argument("--cub_source", type=str, default="hf", choices=["hf", "local"])
     parser.add_argument("--cub_hf_dataset", type=str, default="cassiekang/cub200_dataset")
@@ -670,17 +676,19 @@ def main():
     parser.add_argument("--imagenet_hf_train_split", type=str, default="train")
     parser.add_argument("--imagenet_hf_test_split", type=str, default="validation")
     parser.add_argument("--real_data_dir", type=str, default=None)
+    parser.add_argument("--config", type=str, default=None, help="Path to JSON config file for probe training")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(SEED)
-    print(f"Dataset Type: {args.dataset_type}, Augmentation: {args.augment}")
-    print(f"Scanning synthetic dataset: {args.dataset_dir}")
+    if args.config: load_probe_config(args.config)
+    print(f"Dataset: {args.dataset_type}, Augmentation: {args.augment}")
+
     root = Path(args.dataset_dir)
     class_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
     class_map = {d.name: i for i, d in enumerate(class_dirs)}
     id_to_class_name = {v: k for k, v in class_map.items()}
-
+    
     experiments = {}
     syn_shots_per_class = 0
     for c_name, c_idx in class_map.items():
@@ -691,6 +699,7 @@ def main():
                 for img in m_dir.glob("*.png"):
                     experiments[exp_name]["paths"].append(str(img))
                     experiments[exp_name]["labels"].append(c_idx)
+    
     if len(experiments) > 0:
         first_exp = list(experiments.values())[0]
         if len(class_map) > 0: syn_shots_per_class = len(first_exp["paths"]) // len(class_map)
@@ -706,12 +715,11 @@ def main():
         target_ids = {}
         for k, v in class_map.items():
             try: target_ids[int(k.split("_")[0])] = v
-            except Exception: pass
+            except: pass
         real_test_imgs, real_test_lbls, dist_imgs, dist_lbls = collect_imagenet_subset(
             args.imagenet_hf_dataset, args.imagenet_hf_test_split, target_ids, MAX_REAL_TEST, DISTRACTOR_IDS)
         real_train_imgs, real_train_lbls, _, _ = collect_imagenet_subset(
             args.imagenet_hf_dataset, args.imagenet_hf_train_split, target_ids, MAX_REAL_TRAIN, None)
-
     elif args.dataset_type == "cub":
         if args.cub_source == "hf":
             real_train_imgs, real_train_lbls = load_real_data_hf_generic(
@@ -719,10 +727,8 @@ def main():
             real_test_imgs, real_test_lbls = load_real_data_hf_generic(
                 args.cub_hf_dataset, args.cub_hf_test_split, class_map, MAX_REAL_TEST, SEED+1, "CUB")
         else:
-            if args.real_data_dir is None: raise ValueError("--real_data_dir required")
             real_train_imgs, real_train_lbls = load_cub_real_data_local(args.real_data_dir, class_map, "train", MAX_REAL_TRAIN)
             real_test_imgs, real_test_lbls = load_cub_real_data_local(args.real_data_dir, class_map, "validation", MAX_REAL_TEST)
-
     elif args.dataset_type == "food101":
         real_train_imgs, real_train_lbls = load_real_data_hf_generic(
             args.food_hf_dataset, args.food_hf_train_split, class_map, MAX_REAL_TRAIN, SEED, "Food101")
@@ -730,12 +736,12 @@ def main():
             args.food_hf_dataset, args.food_hf_test_split, class_map, MAX_REAL_TEST, SEED+1, "Food101")
 
     real_fewshot_imgs, real_fewshot_lbls = get_fewshot_subset(real_train_imgs, real_train_lbls, syn_shots_per_class)
-    print(f"Created Real_FewShot dataset with {len(real_fewshot_imgs)} images.")
 
     final_results = []
     class_wise_results = []
     acc_store = {model_name: {} for model_name in EVAL_MODELS.keys()}
-    cm_store = {model_name: {} for model_name in EVAL_MODELS.keys()} # CM Store
+    cm_store = {model_name: {} for model_name in EVAL_MODELS.keys()}
+    loss_store_resnet = {} 
 
     for eval_name, model_id in EVAL_MODELS.items():
         print(f"\n--- Judge: {eval_name} ---")
@@ -758,14 +764,17 @@ def main():
             train_real_ds = PilImageDataset(real_train_imgs, real_train_lbls, transform_train)
             train_real_loader = DataLoader(train_real_ds, batch_size=BATCH_SIZE, shuffle=True)
             X_train_real, y_train_real = extract_features_and_labels(extractor, train_real_loader)
-            clf = LogisticRegression(max_iter=2000, solver="lbfgs")
-            clf.fit(X_train_real, y_train_real)
+            
+            clf_model, loss_hist = train_linear_probe_and_track_loss(X_train_real, y_train_real, len(class_map))
+            
+            if eval_name == STANDARD_EVALUATOR: loss_store_resnet["Real_Baseline"] = loss_hist
+
             acc, cls_res, acc_vec, cm = evaluate_per_class(
-                clf, X_test, y_test, id_to_class_name, "Real_Baseline", eval_name, args.output_dir
+                clf_model, X_test, y_test, id_to_class_name, "Real_Baseline", eval_name, args.output_dir
             )
             class_wise_results.extend(cls_res)
             acc_store[eval_name]["Real_Baseline"] = acc_vec
-            cm_store[eval_name]["Real_Baseline"] = cm # Store CM
+            cm_store[eval_name]["Real_Baseline"] = cm
             final_results.append({"Generator": "Real_Baseline", "Evaluator": eval_name, "Accuracy": acc})
             
             tsne_dir = os.path.join(args.output_dir, "tsne_plots", eval_name)
@@ -778,14 +787,17 @@ def main():
             train_few_ds = PilImageDataset(real_fewshot_imgs, real_fewshot_lbls, transform_train)
             train_few_loader = DataLoader(train_few_ds, batch_size=BATCH_SIZE, shuffle=True)
             X_train_few, y_train_few = extract_features_and_labels(extractor, train_few_loader)
-            clf = LogisticRegression(max_iter=2000, solver="lbfgs")
-            clf.fit(X_train_few, y_train_few)
+            
+            clf_model, loss_hist = train_linear_probe_and_track_loss(X_train_few, y_train_few, len(class_map))
+            
+            if eval_name == STANDARD_EVALUATOR: loss_store_resnet["Real_FewShot"] = loss_hist
+
             acc, cls_res, acc_vec, cm = evaluate_per_class(
-                clf, X_test, y_test, id_to_class_name, "Real_FewShot", eval_name, args.output_dir
+                clf_model, X_test, y_test, id_to_class_name, "Real_FewShot", eval_name, args.output_dir
             )
             class_wise_results.extend(cls_res)
             acc_store[eval_name]["Real_FewShot"] = acc_vec
-            cm_store[eval_name]["Real_FewShot"] = cm # Store CM
+            cm_store[eval_name]["Real_FewShot"] = cm
             final_results.append({"Generator": "Real_FewShot", "Evaluator": eval_name, "Accuracy": acc})
 
         for exp_name, data in experiments.items():
@@ -794,14 +806,17 @@ def main():
             train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
             X_syn, y_syn = extract_features_and_labels(extractor, train_loader)
             if X_syn is None: continue
-            clf = LogisticRegression(max_iter=2000, solver="lbfgs")
-            clf.fit(X_syn, y_syn)
+            
+            clf_model, loss_hist = train_linear_probe_and_track_loss(X_syn, y_syn, len(class_map))
+            
+            if eval_name == STANDARD_EVALUATOR: loss_store_resnet[exp_name] = loss_hist
+
             acc, cls_res, acc_vec, cm = evaluate_per_class(
-                clf, X_test, y_test, id_to_class_name, exp_name, eval_name, args.output_dir
+                clf_model, X_test, y_test, id_to_class_name, exp_name, eval_name, args.output_dir
             )
             class_wise_results.extend(cls_res)
             acc_store[eval_name][exp_name] = acc_vec
-            cm_store[eval_name][exp_name] = cm # Store CM
+            cm_store[eval_name][exp_name] = cm
             final_results.append({"Generator": exp_name, "Evaluator": eval_name, "Accuracy": acc})
             
             tsne_path = os.path.join(args.output_dir, "tsne_plots", eval_name, f"{exp_name}.png")
@@ -816,24 +831,18 @@ def main():
     if final_results:
         df = pd.DataFrame(final_results)
         piv = df.pivot(index="Generator", columns="Evaluator", values="Accuracy")
-        cols = [c for c in EVAL_MODELS.keys() if c in piv.columns]
-        piv = piv[cols]
         csv_path = os.path.join(args.output_dir, "final_results.csv")
         piv.to_csv(csv_path)
         print(f"\nSaved overall results to {csv_path}")
         calculate_self_preference(final_results, args.output_dir)
 
     if class_wise_results:
-        df_cls = pd.DataFrame(class_wise_results)
-        df_cls = df_cls[["Generator", "Evaluator", "Class", "Accuracy"]]
-        cls_csv_path = os.path.join(args.output_dir, "class_wise_accuracy.csv")
-        df_cls.to_csv(cls_csv_path, index=False)
-        print(f"\nSaved class-wise accuracy to {cls_csv_path}")
+        pd.DataFrame(class_wise_results).to_csv(os.path.join(args.output_dir, "class_wise_accuracy.csv"), index=False)
 
-    print("\n--- Calculating Policy Correlations ---")
+    print("\n--- Calculating Metrics ---")
     calculate_complex_correlations(acc_store, experiments, args.output_dir)
-    print("\n--- Calculating Confusion Matrix Similarities ---")
     calculate_confusion_matrix_similarity(cm_store, experiments, args.output_dir)
+    if loss_store_resnet: save_loss_metrics(loss_store_resnet, args.output_dir)
 
 if __name__ == "__main__":
     main()
