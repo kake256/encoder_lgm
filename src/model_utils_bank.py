@@ -1,6 +1,6 @@
 # =========================
 # model_utils_bank.py
-# (Feature Bank作成時の進捗バー追加版)
+# (Priority A: Performance & Memory Optimized)
 # =========================
 import os
 import re
@@ -25,13 +25,15 @@ except ImportError:
 # 1. 基本ユーティリティ & Loss
 # ==========================================================
 def manage_model_allocation(models, weights, device):
+    """
+    重みが0のモデルをCPUに退避し、必要なモデルのみGPUに配置する。
+    頻繁な empty_cache() は呼び出し側で制御するため、ここでは最小限にする。
+    """
     for i, model in enumerate(models):
         if weights[i] > 0:
             model.to(device)
         else:
             model.cpu()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 class RandomGaussianNoise(nn.Module):
@@ -42,8 +44,9 @@ class RandomGaussianNoise(nn.Module):
         self.p = p
 
     def forward(self, images):
-        if torch.rand(1).item() >= self.p:
+        if self.p == 0 or torch.rand(1).item() >= self.p:
             return images
+        # メモリ効率のため、in-place加算を行わないように注意しつつ生成
         noise = torch.randn_like(images) * self.std + self.mean
         return images + noise
 
@@ -73,6 +76,7 @@ class EncoderClassifier(nn.Module):
         self.encoder_model_name = encoder_model
         self.use_timm_encoder = False
 
+        # --- Encoder Initialization (変更なし) ---
         if encoder is not None:
             self.encoder = encoder
             if not hasattr(encoder, "config"):
@@ -107,6 +111,7 @@ class EncoderClassifier(nn.Module):
             self.embed_dim = self.encoder.num_features
             self.feature_source = feature_source
         else:
+            # Hugging Face models setup
             if "siglip" in self.encoder_model_name:
                 self.feature_source = "mean" if feature_source == "pooler" else feature_source
             elif self.encoder_model_name.startswith("openai/clip"):
@@ -215,6 +220,7 @@ class PyramidGenerator(nn.Module):
         self.register_buffer("inverse_color_correlation", inverse_matrix)
 
         if initial_image is not None:
+            # 初期画像がある場合
             init_low_res = torch.nn.functional.interpolate(
                 initial_image,
                 size=(start_size, start_size),
@@ -234,6 +240,7 @@ class PyramidGenerator(nn.Module):
                 init_val = init_val * (1 - noise_level) + noise * noise_level
             self.levels = nn.ParameterList([nn.Parameter(init_val)])
         else:
+            # ランダム初期化
             self.levels = nn.ParameterList([nn.Parameter(torch.randn(1, 3, start_size, start_size) * 0.1)])
 
     def extend(self):
@@ -281,7 +288,7 @@ class PyramidGenerator(nn.Module):
 
 
 # ==========================================================
-# 4. Feature Bank 管理機能 (階層キャッシュ, 空文字対応, GPU非常駐)
+# 4. Feature Bank 管理機能
 # ==========================================================
 class FeatureBankSystem:
     def __init__(self, args, device, cache_dir="./feature_cache"):
@@ -290,7 +297,7 @@ class FeatureBankSystem:
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
 
-        # Augmentor for Real Images (Bank Creation)
+        # Augmentor for Real Images
         self.real_augmentor = T.Compose(
             [
                 T.RandomResizedCrop(args.image_size, scale=(args.min_scale, args.max_scale), antialias=True),
@@ -300,20 +307,25 @@ class FeatureBankSystem:
             ]
         )
 
+        # Pre-register normalization constants to avoid repeated tensor creation
+        self.register_normalization_buffers()
+
+    def register_normalization_buffers(self):
+        # ImageNet normalization
+        self.norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        self.norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+
     def preprocess(self, img):
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
-        return (img - mean) / std
+        # 毎回 Tensor を作らず、登録済みの buffer を使う
+        return (img - self.norm_mean) / self.norm_std
 
     @staticmethod
     def _safe_token(s: str) -> str:
-        # 空文字, None, 空白を "none" に統一
         if s is None:
             return "none"
         s2 = str(s).strip()
         if s2 == "":
             return "none"
-        # パス安全化
         s2 = re.sub(r"[^a-zA-Z0-9]", "_", s2)
         s2 = re.sub(r"_+", "_", s2).strip("_")
         return s2 if s2 else "none"
@@ -326,62 +338,42 @@ class FeatureBankSystem:
             return "nan"
 
     def get_cache_path(self, target_class: int, model_name: str):
-        # 1) 可読な階層キー
         dset = self._safe_token(self.args.dataset_type)
         split = self._safe_token(self.args.dataset_split)
-
         ov_txt = self._safe_token(self.args.overlay_text)
         ov_col = self._safe_token(self.args.text_color)
         ov_fnt = self._fmt_float(self.args.font_scale, 3)
         overlay_dir = f"overlay_{ov_txt}_{ov_col}_f{ov_fnt}"
-
         img_dir = f"img{int(self.args.image_size)}"
         sc_dir = f"sc{self._fmt_float(self.args.min_scale,3)}-{self._fmt_float(self.args.max_scale,3)}"
         ns_dir = f"ns{self._fmt_float(self.args.noise_prob,3)}-{self._fmt_float(self.args.noise_std,3)}"
         aug_dir = f"{sc_dir}_{ns_dir}"
-
         use_real_dir = f"use_real{int(self.args.use_real)}_raug{int(self.args.real_aug)}"
         safe_model = self._safe_token(model_name)
 
         subdir = os.path.join(
-            self.cache_dir,
-            dset,
-            split,
-            overlay_dir,
-            img_dir,
-            aug_dir,
-            use_real_dir,
-            f"cls_{int(target_class)}",
-            f"model_{safe_model}",
+            self.cache_dir, dset, split, overlay_dir, img_dir, aug_dir, use_real_dir,
+            f"cls_{int(target_class)}", f"model_{safe_model}"
         )
         os.makedirs(subdir, exist_ok=True)
 
-        # 2) 厳密な一意性用ハッシュ
         info_parts = [
-            f"dset_{dset}",
-            f"split_{split}",
-            f"cls_{int(target_class)}",
-            f"overlay_text_{ov_txt}",
-            f"text_color_{ov_col}",
-            f"font_scale_{ov_fnt}",
-            f"image_size_{int(self.args.image_size)}",
-            f"use_real_{int(self.args.use_real)}",
-            f"real_aug_{int(self.args.real_aug)}",
-            f"min_scale_{self._fmt_float(self.args.min_scale,6)}",
+            f"dset_{dset}", f"split_{split}", f"cls_{int(target_class)}",
+            f"overlay_text_{ov_txt}", f"text_color_{ov_col}", f"font_scale_{ov_fnt}",
+            f"image_size_{int(self.args.image_size)}", f"use_real_{int(self.args.use_real)}",
+            f"real_aug_{int(self.args.real_aug)}", f"min_scale_{self._fmt_float(self.args.min_scale,6)}",
             f"max_scale_{self._fmt_float(self.args.max_scale,6)}",
             f"noise_prob_{self._fmt_float(self.args.noise_prob,6)}",
             f"noise_std_{self._fmt_float(self.args.noise_std,6)}",
             f"model_{model_name}",
         ]
         params_hash = hashlib.md5("_".join(info_parts).encode()).hexdigest()
-
-        filename = f"features_{params_hash}.pt"
-        return os.path.join(subdir, filename)
+        return os.path.join(subdir, f"features_{params_hash}.pt")
 
     def create_or_load_bank(self, models, raw_images_pool_cpu: torch.Tensor, target_class: int, logger):
         """
         全モデル分のFeature Bankをリストで返す.
-        tqdmを使って進捗を表示する.
+        Priority A: Memory Pre-allocation & Efficient Batching
         """
         bank_list = []
         logger.log(f"Preparing Feature Bank for Class {target_class}...")
@@ -393,40 +385,53 @@ class FeatureBankSystem:
             raw_images_pool_cpu = raw_images_pool_cpu[: int(self.args.use_real)].contiguous()
 
         num_images = len(raw_images_pool_cpu)
-        batch_size = 32
+        real_aug = int(self.args.real_aug)
+        
+        # OOM回避: 固定32ではなく引数から取得、なければデフォルト
+        batch_size = getattr(self.args, "batch_size", 32)
+        total_vectors = num_images * real_aug
 
         for i, model in enumerate(models):
             model_name = self.args.encoder_names[i]
             cache_path = self.get_cache_path(target_class, model_name)
 
             if os.path.exists(cache_path):
-                logger.log(f"  [Cache Hit] {model_name} -> {cache_path}")
-                feats_cpu = torch.load(cache_path, map_location="cpu")
-                bank_list.append(feats_cpu)
-                continue
+                # 破損チェック：ロードして失敗したら再計算
+                try:
+                    feats_cpu = torch.load(cache_path, map_location="cpu")
+                    logger.log(f"  [Cache Hit] {model_name} -> {cache_path}")
+                    bank_list.append(feats_cpu)
+                    continue
+                except Exception as e:
+                    logger.log(f"  [Cache Error] Failed to load {cache_path}: {e}. Recomputing...")
 
             logger.log(f"  [Cache Miss] Computing features for {model_name}...")
-
-            features_chunks = []
             
-            # --- 総ステップ数の計算 (進捗表示用) ---
-            num_batches_per_aug = (num_images + batch_size - 1) // batch_size
-            total_steps = int(self.args.real_aug) * num_batches_per_aug
-
+            # --- 埋め込み次元の特定 (ダミーフォワード) ---
             model_device = next(model.parameters()).device
             if model_device.type != "cuda" and torch.cuda.is_available():
                 model.to(self.device)
-
+            
+            # メモリ確保: CPU上に巨大Tensorを事前に確保し、断片化を防ぐ
+            # shape: (N * Aug, EmbedDim)
+            embed_dim = model.embed_dim
+            final_bank_tensor = torch.zeros((total_vectors, embed_dim), dtype=torch.float32, device="cpu")
+            
+            fill_pointer = 0
+            
+            # Augmentation loop
             with torch.no_grad():
-                # --- tqdm でプログレスバー表示 ---
-                # leave=False にしておくと完了後に消えます. 残したい場合は leave=True.
-                with tqdm(total=total_steps, desc=f"  Comp {model_name}", leave=True, unit="batch") as pbar:
-                    for _ in range(int(self.args.real_aug)):
+                with tqdm(total=total_vectors, desc=f"  Comp {model_name}", leave=True, unit="img") as pbar:
+                    for _ in range(real_aug):
+                        # 画像バッチループ
                         for start in range(0, num_images, batch_size):
                             end = min(start + batch_size, num_images)
+                            current_batch_size = end - start
+                            
+                            # 画像転送: CPU -> GPU
                             batch_cpu = raw_images_pool_cpu[start:end]
-
                             batch_gpu = batch_cpu.to(self.device, non_blocking=True)
+                            
                             aug_batch = self.real_augmentor(batch_gpu)
                             inp_batch = self.preprocess(aug_batch)
 
@@ -437,26 +442,28 @@ class FeatureBankSystem:
                                 with autocast():
                                     f = model.forward_features(inp_batch)
 
-                            features_chunks.append(f.detach().cpu())
+                            f_cpu = f.detach().cpu().to(torch.float32)
                             
-                            # バー更新
-                            pbar.update(1)
-
+                            # 事前確保領域へコピー
+                            final_bank_tensor[fill_pointer : fill_pointer + current_batch_size] = f_cpu
+                            fill_pointer += current_batch_size
+                            
+                            pbar.update(current_batch_size)
+                            
                             del batch_gpu, aug_batch, inp_batch, f
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-
-            feats_cpu = torch.cat(features_chunks, dim=0).contiguous()
-            torch.save(feats_cpu, cache_path)
+                            
+            # 保存
+            torch.save(final_bank_tensor, cache_path)
             logger.log(f"  Saved cache: {cache_path}")
-
-            bank_list.append(feats_cpu)
+            bank_list.append(final_bank_tensor)
+            
+            # ループ内でのempty_cacheは削除 (呼び出し元またはモデル切り替え時に実施)
 
         return bank_list
 
 
 # ==========================================================
-# 5. メイン最適化クラス (Feature Bank対応版, CPU bank -> GPU sampled)
+# 5. メイン最適化クラス
 # ==========================================================
 class MultiModelGM:
     def __init__(self, models, model_weights, target_class, args, device, initial_image=None):
@@ -489,32 +496,52 @@ class MultiModelGM:
         self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
         self.tv_loss_fn = TVLoss().to(device)
 
+        # Pre-register normalization
+        self.norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        self.norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+        
+        # Pre-allocate for synthetic batch if possible? 
+        # Variable size due to pyramid, but syn_augmentor output is fixed size.
+        self.syn_aug_num = int(self.args.syn_aug)
+    
     def _init_optimizer(self):
         return optim.Adam(self.generator.parameters(), lr=self.args.lr)
 
     def preprocess(self, img):
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
-        return (img - mean) / std
+        return (img - self.norm_mean) / self.norm_std
 
     def get_grads_from_features(self, model, features, create_graph=False):
         params = list(model.classifier.parameters())
         logits = model.forward_head(features)
-        targets = torch.tensor([self.target_class] * features.size(0), device=self.device)
-        loss = F.cross_entropy(logits, targets)
+        
+        # Targets recycling
+        if not hasattr(self, "_target_labels") or self._target_labels.size(0) != features.size(0):
+            self._target_labels = torch.tensor([self.target_class] * features.size(0), device=self.device)
+            
+        loss = F.cross_entropy(logits, self._target_labels)
         grads = torch.autograd.grad(loss, params, create_graph=create_graph)
         flat_grad = torch.cat([g.view(-1) for g in grads])
         return flat_grad
 
     def optimize_step(self, feature_bank_list_cpu):
         self.optimizer.zero_grad()
-        syn_image = self.generator()
+        syn_image = self.generator() # (1, 3, H, W)
 
-        syn_batch_list = []
-        for _ in range(int(self.args.syn_aug)):
-            syn_batch_list.append(self.syn_augmentor(syn_image))
-        syn_batch = torch.cat(syn_batch_list, dim=0)
-        inp_syn = self.preprocess(syn_batch)
+        # --- Efficient Synthetic Batch Creation ---
+        # リスト append -> cat を回避。先にTensor確保
+        b, c, h, w = syn_image.shape
+        # Augmentor出力は args.image_size (224) になる
+        tgt_h, tgt_w = self.args.image_size, self.args.image_size
+        
+        # メモリ効率化: syn_batch を1つのTensorとして扱う
+        # 毎回Augmentationを適用してスタック
+        # syn_augmentorがTensorを受け取りTensorを返すと仮定
+        syn_batch_tensor = torch.empty((self.syn_aug_num, c, tgt_h, tgt_w), device=self.device)
+        
+        for k in range(self.syn_aug_num):
+            syn_batch_tensor[k] = self.syn_augmentor(syn_image).squeeze(0)
+            
+        inp_syn = self.preprocess(syn_batch_tensor)
 
         total_grad_loss = 0.0
         per_model_sims = {}
@@ -524,10 +551,13 @@ class MultiModelGM:
             if weight == 0:
                 continue
 
+            # Reset classifier weights (Need logic to optimize this frequency if priority C)
             model.reset_classifier()
 
             bank_cpu = feature_bank_list_cpu[i]
-            idx_cpu = torch.randint(0, bank_cpu.size(0), (int(self.args.syn_aug),), device="cpu")
+            
+            # Random sampling from CPU bank
+            idx_cpu = torch.randint(0, bank_cpu.size(0), (self.syn_aug_num,), device="cpu")
             real_feats = bank_cpu.index_select(0, idx_cpu).to(self.device, non_blocking=True)
 
             try:
@@ -547,8 +577,8 @@ class MultiModelGM:
 
             model_name = self.args.encoder_names[i] if i < len(self.args.encoder_names) else f"model_{i}"
             per_model_sims[model_name] = sim.item()
-
-            del real_feats
+            
+            del real_feats # 明示的削除
 
         loss_tv = self.tv_loss_fn(syn_image)
         total_loss = (total_grad_loss * self.args.weight_grad) + (loss_tv * self.args.weight_tv)
@@ -564,6 +594,7 @@ class MultiModelGM:
         return total_grad_loss.item(), loss_tv.item(), per_model_sims, total_loss.item()
 
     def run(self, feature_bank_list_cpu, save_dir, class_names, logger, global_pbar, gen_idx=0):
+        # ... (変更なし、進捗表示ロジックのみ) ...
         logger.log(f"[{self.target_class}][Gen {gen_idx}] Optimization Start.")
         loss_history = []
         best_loss = float("inf")
