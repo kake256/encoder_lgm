@@ -1,6 +1,6 @@
 # =========================
 # model_utils_bank.py
-# (Feature Bank: 階層キャッシュ, 空文字対応, GPU非常駐, 進捗バー)
+# (Feature Bank作成時の進捗バー追加版)
 # =========================
 import os
 import re
@@ -307,11 +307,13 @@ class FeatureBankSystem:
 
     @staticmethod
     def _safe_token(s: str) -> str:
+        # 空文字, None, 空白を "none" に統一
         if s is None:
             return "none"
         s2 = str(s).strip()
         if s2 == "":
             return "none"
+        # パス安全化
         s2 = re.sub(r"[^a-zA-Z0-9]", "_", s2)
         s2 = re.sub(r"_+", "_", s2).strip("_")
         return s2 if s2 else "none"
@@ -324,6 +326,7 @@ class FeatureBankSystem:
             return "nan"
 
     def get_cache_path(self, target_class: int, model_name: str):
+        # 1) 可読な階層キー
         dset = self._safe_token(self.args.dataset_type)
         split = self._safe_token(self.args.dataset_split)
 
@@ -353,188 +356,7 @@ class FeatureBankSystem:
         )
         os.makedirs(subdir, exist_ok=True)
 
-        info_parts = [
-            f"dset_{dset}",
-            f"split_{split}",
-            f"cls_{int(target_class)}",
-            f"overlay_text_{ov_txt}",
-            f"text_color_{ov_col}",
-            f"font_scale_{ov_fnt}",
-            f"image_size_{int(self.args.image_size)}",
-            f"use_real_{int(self.args.use_real)}",
-            f"real_aug_{int(self.args.real_aug)}",
-            f"min_scale_{self._fmt_float(self.args.min_scale,6)}",
-            f"max_scale_{self._fmt_float(self.args.max_scale,6)}",
-            f"noise_prob_{self._fmt_float(self.args.noise_prob,6)}",
-            f"noise_std_{self._fmt_float(self.args.noise_std,6)}",
-            f"model_{model_name}",
-        ]
-        params_hash = hashlib.md5("_".join(info_parts).encode()).hexdigest()
-        filename = f"features_{params_hash}.pt"
-        return os.path.join(subdir, filename)
-
-    # 追加: skip_cache 用, キャッシュだけロードして返す
-    def load_bank_only(self, models, target_class: int, logger):
-        bank_list = []
-        logger.log(f"Loading Feature Bank ONLY for Class {target_class} (skip_cache mode).")
-
-        for i, _model in enumerate(models):
-            model_name = self.args.encoder_names[i]
-            cache_path = self.get_cache_path(target_class, model_name)
-
-            if not os.path.exists(cache_path):
-                raise FileNotFoundError(f"Cache missing (skip_cache=True). model={model_name}, path={cache_path}")
-
-            logger.log(f"  [Cache Load] {model_name} <- {cache_path}")
-            feats_cpu = torch.load(cache_path, map_location="cpu")
-            bank_list.append(feats_cpu)
-
-        return bank_list
-
-    # 修正: require_cache を受け取れるようにする
-    def create_or_load_bank(self, models, raw_images_pool_cpu: torch.Tensor, target_class: int, logger, require_cache: bool = False):
-        """
-        全モデル分のFeature Bankをリストで返す.
-        require_cache=True の場合, キャッシュが無ければ例外で落とす(計算しない).
-        """
-        bank_list = []
-        logger.log(f"Preparing Feature Bank for Class {target_class}... (require_cache={require_cache})")
-
-        if raw_images_pool_cpu.device.type != "cpu":
-            raw_images_pool_cpu = raw_images_pool_cpu.cpu()
-
-        if int(self.args.use_real) > 0:
-            raw_images_pool_cpu = raw_images_pool_cpu[: int(self.args.use_real)].contiguous()
-
-        num_images = len(raw_images_pool_cpu)
-        batch_size = 32
-
-        for i, model in enumerate(models):
-            model_name = self.args.encoder_names[i]
-            cache_path = self.get_cache_path(target_class, model_name)
-
-            if os.path.exists(cache_path):
-                logger.log(f"  [Cache Hit] {model_name} -> {cache_path}")
-                feats_cpu = torch.load(cache_path, map_location="cpu")
-                bank_list.append(feats_cpu)
-                continue
-
-            if require_cache:
-                raise FileNotFoundError(f"Cache missing (require_cache=True). model={model_name}, path={cache_path}")
-
-            logger.log(f"  [Cache Miss] Computing features for {model_name}...")
-
-            features_chunks = []
-
-            num_batches_per_aug = (num_images + batch_size - 1) // batch_size
-            total_steps = int(self.args.real_aug) * num_batches_per_aug
-
-            model_device = next(model.parameters()).device
-            if model_device.type != "cuda" and torch.cuda.is_available():
-                model.to(self.device)
-
-            with torch.no_grad():
-                with tqdm(total=total_steps, desc=f"  Comp {model_name}", leave=True, unit="batch") as pbar:
-                    for _ in range(int(self.args.real_aug)):
-                        for start in range(0, num_images, batch_size):
-                            end = min(start + batch_size, num_images)
-                            batch_cpu = raw_images_pool_cpu[start:end]
-
-                            batch_gpu = batch_cpu.to(self.device, non_blocking=True)
-                            aug_batch = self.real_augmentor(batch_gpu)
-                            inp_batch = self.preprocess(aug_batch)
-
-                            try:
-                                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                                    f = model.forward_features(inp_batch)
-                            except Exception:
-                                with autocast():
-                                    f = model.forward_features(inp_batch)
-
-                            features_chunks.append(f.detach().cpu())
-                            pbar.update(1)
-
-                            del batch_gpu, aug_batch, inp_batch, f
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-
-            feats_cpu = torch.cat(features_chunks, dim=0).contiguous()
-            torch.save(feats_cpu, cache_path)
-            logger.log(f"  Saved cache: {cache_path}")
-
-            bank_list.append(feats_cpu)
-
-        return bank_list
-
-
-    def __init__(self, args, device, cache_dir="./feature_cache"):
-        self.args = args
-        self.device = device
-        self.cache_dir = cache_dir
-        os.makedirs(self.cache_dir, exist_ok=True)
-
-        self.real_augmentor = T.Compose(
-            [
-                T.RandomResizedCrop(args.image_size, scale=(args.min_scale, args.max_scale), antialias=True),
-                T.RandomHorizontalFlip(p=0.5),
-                T.ColorJitter(0.1, 0.1, 0.1, 0.05),
-                RandomGaussianNoise(mean=0.0, std=args.noise_std, p=args.noise_prob),
-            ]
-        )
-
-    def preprocess(self, img):
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
-        return (img - mean) / std
-
-    @staticmethod
-    def _safe_token(s: str) -> str:
-        if s is None:
-            return "none"
-        s2 = str(s).strip()
-        if s2 == "":
-            return "none"
-        s2 = re.sub(r"[^a-zA-Z0-9]", "_", s2)
-        s2 = re.sub(r"_+", "_", s2).strip("_")
-        return s2 if s2 else "none"
-
-    @staticmethod
-    def _fmt_float(x: float, ndigits: int = 3) -> str:
-        try:
-            return f"{float(x):.{ndigits}f}"
-        except Exception:
-            return "nan"
-
-    def get_cache_path(self, target_class: int, model_name: str):
-        dset = self._safe_token(self.args.dataset_type)
-        split = self._safe_token(self.args.dataset_split)
-
-        ov_txt = self._safe_token(self.args.overlay_text)
-        ov_col = self._safe_token(self.args.text_color)
-        ov_fnt = self._fmt_float(self.args.font_scale, 3)
-        overlay_dir = f"overlay_{ov_txt}_{ov_col}_f{ov_fnt}"
-
-        img_dir = f"img{int(self.args.image_size)}"
-        sc_dir = f"sc{self._fmt_float(self.args.min_scale,3)}-{self._fmt_float(self.args.max_scale,3)}"
-        ns_dir = f"ns{self._fmt_float(self.args.noise_prob,3)}-{self._fmt_float(self.args.noise_std,3)}"
-        aug_dir = f"{sc_dir}_{ns_dir}"
-
-        use_real_dir = f"use_real{int(self.args.use_real)}_raug{int(self.args.real_aug)}"
-        safe_model = self._safe_token(model_name)
-
-        subdir = os.path.join(
-            self.cache_dir,
-            dset,
-            split,
-            overlay_dir,
-            img_dir,
-            aug_dir,
-            use_real_dir,
-            f"cls_{int(target_class)}",
-            f"model_{safe_model}",
-        )
-        os.makedirs(subdir, exist_ok=True)
-
+        # 2) 厳密な一意性用ハッシュ
         info_parts = [
             f"dset_{dset}",
             f"split_{split}",
@@ -556,10 +378,10 @@ class FeatureBankSystem:
         filename = f"features_{params_hash}.pt"
         return os.path.join(subdir, filename)
 
-    def create_or_load_bank(self, models, raw_images_pool_cpu: torch.Tensor, target_class: int, logger, require_cache: bool = False):
+    def create_or_load_bank(self, models, raw_images_pool_cpu: torch.Tensor, target_class: int, logger):
         """
         全モデル分のFeature Bankをリストで返す.
-        require_cache=True の場合, キャッシュが無ければ即エラーにする(生成フェーズ用).
+        tqdmを使って進捗を表示する.
         """
         bank_list = []
         logger.log(f"Preparing Feature Bank for Class {target_class}...")
@@ -583,13 +405,11 @@ class FeatureBankSystem:
                 bank_list.append(feats_cpu)
                 continue
 
-            if require_cache:
-                raise FileNotFoundError(f"[skip_cache] cache not found for model={model_name}, class={target_class}. path={cache_path}")
-
             logger.log(f"  [Cache Miss] Computing features for {model_name}...")
 
             features_chunks = []
-
+            
+            # --- 総ステップ数の計算 (進捗表示用) ---
             num_batches_per_aug = (num_images + batch_size - 1) // batch_size
             total_steps = int(self.args.real_aug) * num_batches_per_aug
 
@@ -598,6 +418,8 @@ class FeatureBankSystem:
                 model.to(self.device)
 
             with torch.no_grad():
+                # --- tqdm でプログレスバー表示 ---
+                # leave=False にしておくと完了後に消えます. 残したい場合は leave=True.
                 with tqdm(total=total_steps, desc=f"  Comp {model_name}", leave=True, unit="batch") as pbar:
                     for _ in range(int(self.args.real_aug)):
                         for start in range(0, num_images, batch_size):
@@ -616,6 +438,8 @@ class FeatureBankSystem:
                                     f = model.forward_features(inp_batch)
 
                             features_chunks.append(f.detach().cpu())
+                            
+                            # バー更新
                             pbar.update(1)
 
                             del batch_gpu, aug_batch, inp_batch, f
@@ -632,7 +456,7 @@ class FeatureBankSystem:
 
 
 # ==========================================================
-# 5. メイン最適化クラス (CPU bank -> GPU sampled)
+# 5. メイン最適化クラス (Feature Bank対応版, CPU bank -> GPU sampled)
 # ==========================================================
 class MultiModelGM:
     def __init__(self, models, model_weights, target_class, args, device, initial_image=None):
