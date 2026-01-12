@@ -29,7 +29,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # Update this to point to your latest python script
 PYTHON_SCRIPT="$PROJECT_ROOT/src/evaluate_linear2.py"
 
-DEFAULT_DATASET_DIR="$PROJECT_ROOT/makeData/dataset_clean"
+DEFAULT_DATASET_DIR="$PROJECT_ROOT/makeData/dataset_clean_ImageNet1k_200"
 DEFAULT_DATASET_TYPE="imagenet"
 
 # linear_lbfgs override (optional)

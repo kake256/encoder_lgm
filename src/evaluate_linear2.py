@@ -2,6 +2,7 @@
 # 内容: エントリーポイント. 実験のセットアップ, ループ実行, 結果の保存を担当
 
 import os
+import math
 import argparse
 import numpy as np
 import pandas as pd
@@ -57,6 +58,11 @@ def main():
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # 【追加修正】Logフォルダのパスを作成し、実際にフォルダを作る
+    log_save_dir = os.path.join(args.output_dir, "Log")
+    os.makedirs(log_save_dir, exist_ok=True)
+
     set_seed(SEED)
 
     mode = args.mode
@@ -71,6 +77,7 @@ def main():
     print(f" [Settings] Device    : {DEVICE}")
     print(f" [Settings] Config    : {config}")
     print(f" [Data]     Target    : {args.dataset_type} (HF)")
+    print(f" [Output]   Log Dir   : {log_save_dir}") # 確認用表示
     print("-" * 60)
 
     if torch.cuda.is_available():
@@ -98,8 +105,11 @@ def main():
     if len(experiments) > 0:
         first_exp = list(experiments.values())[0]
         if num_classes > 0:
-            syn_shots_per_class = max(1, len(first_exp["paths"]) // num_classes)
-        print(f" [Data]     Syn Shots   : ~{syn_shots_per_class} img/class")
+            # 切り上げ計算 (前回の修正を維持)
+            raw_shots = len(first_exp["paths"]) / num_classes
+            syn_shots_per_class = max(1, math.ceil(raw_shots))
+            
+        print(f" [Data]     Syn Shots   : ~{syn_shots_per_class} img/class (Calculated from {len(first_exp['paths'])} imgs)")
 
     print("\n [Step] Loading Real Data (HuggingFace)...")
     real_train_imgs, real_train_lbls = [], []
@@ -190,8 +200,12 @@ def main():
             if mode == "linear_lbfgs":
                 acc, t_acc, t_p, tot_p, yt, yp = train_sklearn_lbfgs(extractor, ldr, X_test, y_test, config)
             else:
+                run_tag = f"{name}__{eval_name}"
+                # 【修正】log_dir 引数に、作成した log_save_dir を渡す
                 acc, t_acc, t_p, tot_p, lora_t, yt, yp = train_pytorch_pipeline(
-                    extractor, ldr, test_loader, num_classes, mode, config
+                    extractor, ldr, test_loader, num_classes, mode, config,
+                    log_dir=log_save_dir,
+                    run_name=run_tag
                 )
                 if mode == "partial_ft" and t_p < 100000:
                     print(f"    [Check] {name}: Trainable params={t_p}. Too low for partial_ft. fallback is possible.")
@@ -252,7 +266,6 @@ def main():
 
         print(f" >> Analyzing correlations based on target: {target} ...")
         
-        # 関数に target_evaluator を渡す (metrics.py の修正が必要)
         calculate_complex_correlations(
             acc_store, experiments, args.output_dir, target_evaluator=target
         )
