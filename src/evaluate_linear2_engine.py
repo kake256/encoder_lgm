@@ -1,5 +1,5 @@
 # ファイル名: evaluate_linear2_engine.py
-# 内容: PyTorchおよびSklearnの学習ループ, 評価関数 (Loss保存・実験ID対応・サニタイズ強化版)
+# 内容: PyTorchおよびSklearnの学習ループ, 評価関数 (BN修正版)
 
 import os
 import re
@@ -42,11 +42,7 @@ def train_sklearn_lbfgs(extractor, train_loader, X_test, y_test, config):
 def train_pytorch_pipeline(extractor, train_loader, test_loader, num_classes, mode, config, log_dir=None, run_name=None):
     """
     PyTorch学習パイプライン
-    【修正点】
-    - Loss記録とCSV保存
-    - ファイル名サニタイズ (re.sub)
-    - メタデータ記録 (policy, params等)
-    - run_name自動生成フォールバック
+    修正: ループ内で model.set_mode(mode) を使用し、BNの挙動を正しく制御するように変更
     """
     model = TrainableModel(extractor, num_classes).to(DEVICE)
 
@@ -90,15 +86,11 @@ def train_pytorch_pipeline(extractor, train_loader, test_loader, num_classes, mo
     history = []
 
     for epoch in range(max_epochs):
-        if mode == "linear_torch":
-            model.core.eval()
-            model.head.train()
-        else:
-            model.train()
-            # BN層の汚染防止
-            for m in model.modules():
-                if isinstance(m, torch.nn.BatchNorm2d):
-                    m.eval()
+        # =========================================================
+        # 【修正】ここを model.set_mode(mode) に一任する
+        # これにより、scratch時はBN学習(train)、full_ft時はBN固定(eval)が正しく適用される
+        # =========================================================
+        model.set_mode(mode)
 
         running_loss = 0.0
         total_samples = 0
@@ -166,12 +158,10 @@ def train_pytorch_pipeline(extractor, train_loader, test_loader, num_classes, mo
         })
         
         if (epoch + 1) % val_interval == 0:
-            v_loss_str = f"{val_loss:.4f}" if val_loss is not None else "N/A"
-            v_acc_str = f"{val_acc:.4f}" if val_acc is not None else "N/A"
             # 進捗確認用 (必要に応じてコメントアウト解除)
-            # print(f"[{mode}] Ep {epoch+1}: T_Loss={epoch_train_loss:.4f}, V_Loss={v_loss_str}, V_Acc={v_acc_str}")
+            pass
 
-    # 【追加】CSV保存ロジック (サニタイズ + 安全策)
+    # CSV保存ロジック (サニタイズ + 安全策)
     if log_dir:
         # run_name が無い場合のフォールバック
         if not run_name:

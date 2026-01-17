@@ -13,10 +13,13 @@ PROJECT_ROOT = CURRENT_DIR.parent
 
 # ★変更点: 親フォルダではなく、対象の日付フォルダを直接指定します
 # (自動検出による別フォルダの誤検知を防ぐため)
-DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "classification_results" / "gene_experiment_4models_comparison" / "20260101_192533"
+#DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "classification_results" / "gene_experiment_4models_comparison" / "20260101_192533"
+DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "classification_results" / "sent" / "20260115_150140" #"20260115_061103" #"20260115_024226" #"20260112_040759"
+#"20260111_214343" #"20260111_183657" #"20260109_160415" #"20260108_034458" 
 
 # ★変更点: Food101用の出力先に設定
-OUTPUT_DATASET_DIR = PROJECT_ROOT / "makeData" / "dataset_clean_food101"
+#OUTPUT_DATASET_DIR = PROJECT_ROOT / "makeData" / "dataset_clean_food101"
+OUTPUT_DATASET_DIR = PROJECT_ROOT / "makeData" / "dataset_clean_ImageNet1k_200_typo"
 
 # 収集対象のキーワード
 TARGET_KEYWORDS = ["result_gen"]

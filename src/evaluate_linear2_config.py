@@ -12,7 +12,7 @@ SEED = 42
 IMG_SIZE = 224
 
 # [SPEEDUP] High VRAM Settings
-BATCH_SIZE = 1024
+BATCH_SIZE = 2048
 NUM_WORKERS = min(32, os.cpu_count() if os.cpu_count() else 4)
 
 # ========================================================
@@ -25,6 +25,7 @@ MAX_REAL_TEST = 50
 # 3. Model & Evaluator Lists
 # ========================================================
 AVAILABLE_EVAL_MODELS = {
+    # --- Giant Models (Teachers / for Linear Probe & Full FT) ---
     "ResNet50": "microsoft/resnet-50",
     "DINOv1":   "facebook/dino-vitb16",
     "DINOv2":   "facebook/dinov2-base",
@@ -34,7 +35,24 @@ AVAILABLE_EVAL_MODELS = {
     "SwAV":     "swav_resnet50",
     "OpenCLIP_ViT_B32": "openclip:ViT-B-32:laion2b_s34b_b79k",
     "OpenCLIP_RN50":    "openclip:RN50:openai",
-    "OpenCLIP_ConvNeXt": "openclip:convnext_base_w:laion400m_s13b_b51k",
+    "OpenCLIP_ConvNeXt": "openclip:convnext_base_w:laion2b_s13b_b82k",
+
+    # --- Lightweight Models (Targets / for Scratch Training) ---
+    # 1. Ultra-Lightweight
+    "MobileNetV2_050":   "timm:mobilenetv2_050",          # 0.7M (超軽量)
+    
+    # 2. Mobile Standard & Efficient
+    "MobileNetV3_S":     "timm:mobilenetv3_small_100",    # 2.5M
+    "GhostNet_100":      "timm:ghostnet_100",             # 3.9M
+    # 【変更】MNASNet(重みなし) -> EfficientNet-B0 (重みあり・高精度)
+    "EfficientNet_B0":   "timm:efficientnet_b0",          # 5.3M (Googleの高効率モデル)
+    
+    # 3. Modern Architecture
+    "ConvNeXt_Atto":     "timm:convnext_atto",            # 3.7M
+    
+    # 4. ResNet Baseline
+    "ResNet10t":         "timm:resnet10t",                # 5.4M
+    "ResNet18":          "timm:resnet18",                 # 11.7M
 }
 
 GENERATOR_SOURCE_MAP = {
@@ -72,7 +90,6 @@ TRAIN_CONFIGS = {
         "patience": 50,
         "scheduler": "cosine",
         "val_interval": 50,
-        # LR scaling cap. 元コード互換を意識した上限.
         "lr_cap": 0.005,
         "lr_ref_bs": 256.0,
     },
@@ -98,7 +115,6 @@ TRAIN_CONFIGS = {
         "lora_dropout": 0.1,
         "scheduler": "cosine",
         "val_interval": 5,
-        # LoRAの探索候補. 存在しないモジュールは自動除外.
         "lora_candidate_modules": [
             "q_proj", "k_proj", "v_proj", "out_proj",
             "query", "key", "value",
@@ -114,5 +130,27 @@ TRAIN_CONFIGS = {
         "batch_size": 16,
         "scheduler": "cosine",
         "val_interval": 5,
+    },
+    "full_ft_long": {
+        "optimizer": "AdamW",
+        "lr_backbone": 1e-5,
+        "lr_head": 1e-3,
+        "weight_decay": 1e-4,
+        "epochs": 1000,
+        "patience": 50,
+        "batch_size": 16,
+        "scheduler": "cosine",
+        "val_interval": 20,
+    },
+    "scratch": {
+        "optimizer": "AdamW",
+        "lr_backbone": 1e-3,
+        "lr_head": 1e-3,
+        "weight_decay": 1e-4,
+        "epochs": 1000,
+        "patience": 50,
+        "batch_size": 16,
+        "scheduler": "cosine",
+        "val_interval": 20,
     },
 }

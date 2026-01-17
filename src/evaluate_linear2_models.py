@@ -1,5 +1,5 @@
 # ファイル名: evaluate_linear2_models.py
-# 内容: FeatureExtractor, TrainableModel, および学習対象パラメータ選択ロジック
+# 内容: FeatureExtractor (次元確定版), TrainableModel (BN制御修正版), 学習対象選択
 
 import numpy as np
 import torch
@@ -8,64 +8,134 @@ from torchvision import transforms as T
 from PIL import Image
 from tqdm import tqdm
 from torch.cuda.amp import autocast
-from transformers import AutoModel, AutoProcessor, ResNetModel
+from transformers import AutoModel, AutoProcessor, ResNetModel, AutoConfig
 
 from evaluate_linear2_config import DEVICE, IMG_SIZE
 
+# --- Optional Imports ---
 try:
     import open_clip
 except ImportError:
     open_clip = None
 
+try:
+    import timm
+    from timm.data import resolve_data_config
+    from timm.data.transforms_factory import create_transform
+except ImportError:
+    timm = None
+# ------------------------
 
 class FeatureExtractor:
-    def __init__(self, model_identifier: str):
+    def __init__(self, model_identifier: str, pretrained: bool = True):
         self.model_identifier = model_identifier
         self.type = "base"
         self.processor, self.core, self.preprocess = None, None, None
         self.embed_dim = 512
-        print(f"Loading backbone: {model_identifier} ...")
+        
+        init_state = "Pre-trained" if pretrained else "Random Init (Scratch)"
+        print(f"Loading backbone: {model_identifier} [{init_state}] ...")
 
-        # --- [SwAV] ロード処理 ---
+        # =========================================================
+        # [1] timm Models
+        # =========================================================
+        if model_identifier.startswith("timm:"):
+            if timm is None:
+                raise ImportError("Please install timm: `pip install timm`")
+            
+            model_name = model_identifier.split(":", 1)[1]
+            
+            self.core = timm.create_model(
+                model_name, 
+                pretrained=pretrained, 
+                num_classes=0 
+            )
+            self.type = "timm"
+            self.data_config = resolve_data_config({}, model=self.core)
+            self.core.to(DEVICE)
+            self.core.eval() # デフォルトはeval
+
+            # embed_dim 確定
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE, device=DEVICE)
+                out = self.core(dummy)
+                if out.ndim > 2:
+                    out = out.flatten(1)
+                self.embed_dim = int(out.shape[1])
+                print(f"   -> [Debug] Detected embed_dim: {self.embed_dim}")
+            return
+
+        # =========================================================
+        # [2] SwAV
+        # =========================================================
         if model_identifier == "swav_resnet50":
-            # PyTorch HubからSwAV学習済みのResNet50をロード
-            self.core = torch.hub.load('facebookresearch/swav:main', 'resnet50')
-            # 最終層(fc)を無効化して特徴量(2048次元)を直接取り出す
+            self.core = torch.hub.load('facebookresearch/swav:main', 'resnet50', pretrained=pretrained)
             self.core.fc = nn.Identity()
             self.type = "swav"
             self.embed_dim = 2048
             self.core.to(DEVICE)
             self.core.eval()
-            return # 初期化終了
-        # ------------------------
+            return 
 
+        # =========================================================
+        # [3] OpenCLIP
+        # =========================================================
         if model_identifier.startswith("openclip:"):
-            import open_clip
+            if open_clip is None:
+                raise ImportError("Please install open_clip: `pip install open_clip_torch`")
+                
             parts = model_identifier.split(":")
-            self.core, _, self.preprocess = open_clip.create_model_and_transforms(parts[1], pretrained=parts[2] if len(parts)>2 else "openai")
+            pretrained_tag = parts[2] if (len(parts) > 2 and pretrained) else None
+            
+            self.core, _, self.preprocess = open_clip.create_model_and_transforms(
+                parts[1], 
+                pretrained=pretrained_tag
+            )
             self.type = "open_clip"
             self.embed_dim = getattr(self.core.visual, "output_dim", 512)
-        elif "resnet" in model_identifier.lower(): # HF ResNet
-            self.core = ResNetModel.from_pretrained(model_identifier)
-            self.processor = AutoProcessor.from_pretrained(model_identifier)
-            self.type = "resnet_hf"
-            self.embed_dim = self.core.config.hidden_sizes[-1]
-        else: # HF Transformer (MAE, SigLIP, etc.)
-            self.core = AutoModel.from_pretrained(model_identifier)
-            self.processor = AutoProcessor.from_pretrained(model_identifier)
+
+        # =========================================================
+        # [4] Hugging Face Models
+        # =========================================================
+        else:
             self.type = "hf_model"
-            self.embed_dim = self.core.config.hidden_size
+            if "resnet" in model_identifier.lower(): 
+                self.type = "resnet_hf"
+                self.processor = AutoProcessor.from_pretrained(model_identifier)
+                if pretrained:
+                    self.core = ResNetModel.from_pretrained(model_identifier)
+                else:
+                    config = AutoConfig.from_pretrained(model_identifier)
+                    self.core = ResNetModel(config)
+                self.embed_dim = self.core.config.hidden_sizes[-1]
+            else:
+                self.processor = AutoProcessor.from_pretrained(model_identifier)
+                if pretrained:
+                    self.core = AutoModel.from_pretrained(model_identifier)
+                else:
+                    config = AutoConfig.from_pretrained(model_identifier)
+                    self.core = AutoModel.from_config(config)
+                
+                cfg = self.core.config
+                if hasattr(cfg, "projection_dim"): 
+                    self.embed_dim = cfg.projection_dim
+                elif hasattr(cfg, "hidden_size"): 
+                    self.embed_dim = cfg.hidden_size
+                elif hasattr(cfg, "vision_config") and hasattr(cfg.vision_config, "hidden_size"): 
+                    self.embed_dim = cfg.vision_config.hidden_size
+                else:
+                    print(f"Warning: Could not detect embed_dim for {model_identifier}. Using 768.")
+                    self.embed_dim = 768
 
         self.core.to(DEVICE)
         self.core.eval()
 
     def get_transform(self, augment: bool = False):
-        # --- [SwAV] 前処理 ---
+        if self.type == "timm":
+            return create_transform(**self.data_config, is_training=augment)
         if self.type == "swav":
-            # ImageNet標準の正規化
             mean = (0.485, 0.456, 0.406)
             std = (0.229, 0.224, 0.225)
-            
             if augment:
                 return T.Compose([
                     T.RandomResizedCrop(224, scale=(0.8, 1.0), antialias=True),
@@ -80,12 +150,8 @@ class FeatureExtractor:
                     T.ToTensor(),
                     T.Normalize(mean=mean, std=std)
                 ])
-        # ---------------------
-
-        # --- [OpenCLIP] 前処理 (修正: pass を削除しロジックを復元) ---
         if self.type == "open_clip":
             if augment:
-                # CLIP用の Augmentation (Mean/Std は近似値)
                 mean = (0.48145466, 0.4578275, 0.40821073)
                 std = (0.26862954, 0.26130258, 0.27577711)
                 return T.Compose([
@@ -95,25 +161,17 @@ class FeatureExtractor:
                     T.Normalize(mean=mean, std=std)
                 ])
             else:
-                # Augmentationなしの場合は既存のpreprocessを使う
                 return self.preprocess
-        # ------------------------------------------------
 
-        # --- [Hugging Face Models] 前処理 (修正: pass を削除しロジックを復元) ---
         def hf_process_wrapper(img):
-            # Augmentationの適用
             if augment:
                 aug = T.Compose([
                     T.RandomResizedCrop(224, scale=(0.8, 1.0), antialias=True),
                     T.RandomHorizontalFlip()
                 ])
                 img = aug(img)
-            
-            # HFプロセッサに通す
             return self.processor(images=img, return_tensors="pt")["pixel_values"].squeeze(0)
-        
         return hf_process_wrapper
-        # ------------------------------------------------------------
 
     def extract_features(self, dataloader):
         self.core.eval()
@@ -121,21 +179,23 @@ class FeatureExtractor:
         with torch.no_grad(), autocast():
             for imgs, labels in tqdm(dataloader, desc="Extracting", leave=False):
                 imgs = imgs.to(DEVICE)
-                
-                # --- [SwAV] 推論 ---
-                if self.type == "swav":
-                    # fc=Identity() にしているので特徴量が返る
+                if self.type == "timm" or self.type == "swav":
                     f = self.core(imgs)
-                # -------------------------
                 elif self.type == "open_clip": 
                     f = self.core.encode_image(imgs)
                 else: 
-                    # HF models
-                    out = self.core(pixel_values=imgs)
-                    if hasattr(out, "pooler_output") and out.pooler_output is not None: f = out.pooler_output
-                    elif hasattr(out, "last_hidden_state"): f = out.last_hidden_state[:, 0]
-                    else: f = out[0]
-                
+                    if hasattr(self.core, "get_image_features"):
+                        f = self.core.get_image_features(pixel_values=imgs)
+                    else:
+                        out = self.core(pixel_values=imgs)
+                        if hasattr(out, "image_embeds") and out.image_embeds is not None:
+                            f = out.image_embeds
+                        elif hasattr(out, "pooler_output") and out.pooler_output is not None: 
+                            f = out.pooler_output
+                        elif hasattr(out, "last_hidden_state"): 
+                            f = out.last_hidden_state[:, 0]
+                        else: 
+                            f = out[0]
                 if len(f.shape) > 2: f = f.flatten(1)
                 f = f / (f.norm(dim=-1, keepdim=True) + 1e-6)
                 feats.append(f.float().cpu().numpy())
@@ -144,15 +204,10 @@ class FeatureExtractor:
         return np.concatenate(feats), np.concatenate(lbls)
 
 class TrainableModel(nn.Module):
-    """
-    open_clipのとき, .visual だけに差し替えると encode_image が消えるため,
-    full_core と visual_core を分けて保持する.
-    """
     def __init__(self, extractor: FeatureExtractor, num_classes: int):
         super().__init__()
         self.model_type = extractor.type
         self.embed_dim = extractor.embed_dim
-
         self.full_core = None
         self.visual_core = None
         self.core = extractor.core
@@ -166,19 +221,23 @@ class TrainableModel(nn.Module):
         self.head.bias.data.zero_()
 
     def get_features(self, x: torch.Tensor) -> torch.Tensor:
-        if self.model_type == "open_clip":
-            f = self.full_core.encode_image(x)
-        elif self.model_type == "swav": # SwAV対応
+        if self.model_type == "timm" or self.model_type == "swav":
             f = self.core(x)
+        elif self.model_type == "open_clip":
+            f = self.full_core.encode_image(x)
         else:
-            out = self.core(pixel_values=x)
-            if hasattr(out, "pooler_output") and out.pooler_output is not None:
-                f = out.pooler_output
-            elif hasattr(out, "last_hidden_state"):
-                f = out.last_hidden_state[:, 0]
+            if hasattr(self.core, "get_image_features"):
+                f = self.core.get_image_features(pixel_values=x)
             else:
-                f = out[0]
-
+                out = self.core(pixel_values=x)
+                if hasattr(out, "image_embeds") and out.image_embeds is not None:
+                    f = out.image_embeds
+                elif hasattr(out, "pooler_output") and out.pooler_output is not None:
+                    f = out.pooler_output
+                elif hasattr(out, "last_hidden_state"):
+                    f = out.last_hidden_state[:, 0]
+                else:
+                    f = out[0]
         if len(f.shape) > 2:
             f = f.flatten(1)
         f = f / (f.norm(dim=-1, keepdim=True) + 1e-6)
@@ -190,6 +249,26 @@ class TrainableModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = self.get_features(x)
         return self.forward_head(feats)
+    
+    # 【修正】BNの挙動をScratchとFullFTで分離
+    def set_mode(self, mode: str):
+        if mode == "scratch":
+            # Scratch: 統計量がないのでBNも学習する (trainモード)
+            self.train()
+            
+        elif mode in ["full_ft", "full_ft_long"]:
+            # Full FT: 重みは学習したいが、統計量は壊したくない
+            self.train() # 全体は学習モード
+            # BN層だけを探して固定(eval)モードにする
+            for m in self.modules():
+                if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                    m.eval()
+                    
+        elif mode == "partial_ft":
+            self.eval()  
+            self.head.train()
+        else:
+            self.eval()
 
 def _named_module_leaf_keys(module: nn.Module):
     keys = set()
@@ -201,12 +280,11 @@ def _named_module_leaf_keys(module: nn.Module):
     return keys
 
 def select_trainable_params(model: TrainableModel, mode: str, config: dict, train_batch_size: int):
-    """
-    点検の要: partial_ft, lora の対象パラメータをモデル構造に応じて明示的に決定する.
-    return: (params_to_optimize, lora_targets, did_fallback, policy_name)
-    """
+    # 初期化：一旦すべて固定
     for p in model.parameters():
         p.requires_grad = False
+    
+    # Headは常に学習
     for p in model.head.parameters():
         p.requires_grad = True
 
@@ -215,6 +293,9 @@ def select_trainable_params(model: TrainableModel, mode: str, config: dict, trai
     policy_name = "none"
     lora_targets = []
 
+    # -----------------------------------------------------------
+    # Linear Probing
+    # -----------------------------------------------------------
     if mode == "linear_torch":
         base_lr = float(config["lr"])
         ref_bs = float(config.get("lr_ref_bs", 256.0))
@@ -223,28 +304,49 @@ def select_trainable_params(model: TrainableModel, mode: str, config: dict, trai
         scaled_lr = min(base_lr * (bs / ref_bs), lr_cap)
         policy_name = f"head_only_scaled_lr(bs={bs})"
         params_to_optimize = [{"params": model.head.parameters(), "lr": scaled_lr}]
+        
+        # Check
+        n_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"   -> [Debug] Policy: {policy_name}, Trainable Params: {n_p}")
         return params_to_optimize, [], did_fallback, policy_name
 
-    if mode == "full_ft":
+    # -----------------------------------------------------------
+    # Scratch / Full FT
+    # -----------------------------------------------------------
+    if mode == "full_ft" or mode == "full_ft_long" or mode == "scratch":
         policy_name = "full_backbone_plus_head"
+        
+        # 【重要】Backbone全体を解凍
         for p in model.core.parameters():
             p.requires_grad = True
+            
+        if model.model_type == "open_clip":
+             for p in model.full_core.parameters():
+                 p.requires_grad = True
+
         params_to_optimize = [
             {"params": model.core.parameters(), "lr": float(config["lr_backbone"])},
             {"params": model.head.parameters(), "lr": float(config["lr_head"])},
         ]
+        
+        # Check
+        n_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"   -> [Debug] Policy: {policy_name}, Trainable Params: {n_p}")
+        if n_p < 100000:
+            print("   -> [WARNING] Trainable params seem too low for Scratch/Full-FT! Check Freeze logic.")
+            
         return params_to_optimize, [], did_fallback, policy_name
 
+    # -----------------------------------------------------------
+    # Partial FT
+    # -----------------------------------------------------------
     if mode == "partial_ft":
         trainable_backbone = None
-
-        # --- [追加] SwAV (Standard ResNet structure) ---
+        
         if model.model_type == "swav":
-            # PyTorch標準のResNet構造なので layer4 が最終ステージ
             if hasattr(model.core, "layer4"):
                 policy_name = "swav_resnet_layer4"
                 trainable_backbone = list(model.core.layer4.parameters())
-        # -----------------------------------------------
 
         if model.model_type == "resnet_hf" and hasattr(model.core, "encoder") and hasattr(model.core.encoder, "stages"):
             policy_name = "resnet_encoder_stages_last"
@@ -270,26 +372,24 @@ def select_trainable_params(model: TrainableModel, mode: str, config: dict, trai
             did_fallback = True
             policy_name = f"partial_ft_fallback_to_head_only(model_type={model.model_type})"
             params_to_optimize = [{"params": model.head.parameters(), "lr": float(config.get("lr_head", 1e-3))}]
-
+        
+        n_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"   -> [Debug] Policy: {policy_name}, Trainable Params: {n_p}")
         return params_to_optimize, [], did_fallback, policy_name
 
+    # -----------------------------------------------------------
+    # LoRA
+    # -----------------------------------------------------------
     if mode == "lora":
         from peft import LoraConfig, get_peft_model
-
         candidates = list(config.get("lora_candidate_modules", []))
         if not candidates:
             candidates = ["q_proj", "v_proj", "query", "value", "c_fc", "c_proj"]
-
-        # 対象モジュールが存在するかを leaf key でチェックする.
         leaf_keys = _named_module_leaf_keys(model.core)
         chosen = [c for c in candidates if c in leaf_keys]
 
         if not chosen:
-            # 妥当性の観点で, 何も当たらないLoRAは実験として成立しないため止める.
-            raise RuntimeError(
-                f"[LoRA] No target_modules matched. model_type={model.model_type}, "
-                f"candidates={candidates}, leaf_keys(sample)={sorted(list(leaf_keys))[:30]}"
-            )
+            raise RuntimeError(f"[LoRA] No target_modules matched. {model.model_type}")
 
         peft_config = LoraConfig(
             r=int(config["lora_rank"]),
@@ -299,13 +399,15 @@ def select_trainable_params(model: TrainableModel, mode: str, config: dict, trai
             bias="none",
         )
         model.core = get_peft_model(model.core, peft_config)
-
         policy_name = f"lora_targets={chosen}"
         lora_targets = chosen
         params_to_optimize = [
             {"params": model.core.parameters(), "lr": float(config["lr_lora"])},
             {"params": model.head.parameters(), "lr": float(config["lr_head"])},
         ]
+        
+        n_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"   -> [Debug] Policy: {policy_name}, Trainable Params: {n_p}")
         return params_to_optimize, lora_targets, did_fallback, policy_name
 
     return params_to_optimize, lora_targets, did_fallback, policy_name

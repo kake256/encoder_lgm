@@ -16,8 +16,8 @@ set -euo pipefail
 
 # Evaluators (space-separated names, must match keys in AVAILABLE_EVAL_MODELS)
 #SELECTED_EVALUATORS="ResNet50 OpenCLIP_ViT_B32 OpenCLIP_RN50 OpenCLIP_ConvNeXt"
-#SELECTED_EVALUATORS="ResNet50 DINOv1 DINOv2 CLIP SigLIP MAE SwAV OpenCLIP_RN50 OpenCLIP_ViT_B32"
-SELECTED_EVALUATORS="ResNet50 MAE SwAV" #"OpenCLIP_RN50 OpenCLIP_ViT_B32"
+#SELECTED_EVALUATORS="ResNet50 MAE SwAV" #"OpenCLIP_RN50 OpenCLIP_ViT_B32"
+SELECTED_EVALUATORS="ResNet50 DINOv1 DINOv2 CLIP SigLIP MAE SwAV OpenCLIP_RN50 OpenCLIP_ViT_B32"
 
 #ENABLE_AUGMENTATION="false"
 ENABLE_AUGMENTATION="true"
@@ -29,7 +29,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # Update this to point to your latest python script
 PYTHON_SCRIPT="$PROJECT_ROOT/src/evaluate_linear2.py"
 
-DEFAULT_DATASET_DIR="$PROJECT_ROOT/makeData/dataset_clean_ImageNet1k_200"
+DEFAULT_DATASET_DIR="$PROJECT_ROOT/makeData/dataset_clean"
 DEFAULT_DATASET_TYPE="imagenet"
 
 # linear_lbfgs override (optional)
@@ -163,11 +163,12 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 # Sequential Execution Loop: linear_lbfgs -> linear_torch
 # **********========================================================
 #for CURRENT_MODE in "linear_lbfgs" "linear_torch" "partial_ft" "full_ft"; do # Mode 切り替え
-for CURRENT_MODE in "linear_torch" "partial_ft" "full_ft"; do
-#for CURRENT_MODE in "partial_ft" "full_ft"; do # Mode 切り替え
+#for CURRENT_MODE in "linear_torch"; do
+#for CURRENT_MODE in "partial_ft" "full_ft"; do
+for CURRENT_MODE in "linear_torch" "partial_ft" "full_ft"; do # Mode 切り替え
   # Update EVAL_MODE and OUTPUT_DIR for current loop iteration
   EVAL_MODE="$CURRENT_MODE"
-  OUTPUT_DIR="$PROJECT_ROOT/evaluation_results_critique/ImageNet1k_200/${TIMESTAMP}_${EVAL_MODE}"
+  OUTPUT_DIR="$PROJECT_ROOT/evaluation_results_critique/ImageNet1k/${TIMESTAMP}_${EVAL_MODE}"
   mkdir -p "$OUTPUT_DIR"
 
   # Generate config json for each run (probe_config.json)

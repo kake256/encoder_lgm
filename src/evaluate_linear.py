@@ -18,25 +18,58 @@ from scipy.stats import spearmanr
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
 from sklearn.manifold import TSNE
 from sklearn.metrics import confusion_matrix, accuracy_score
+from sklearn.linear_model import LogisticRegression
 
 from datasets import load_dataset
-from transformers import AutoModel, AutoProcessor, CLIPModel, CLIPProcessor, ResNetModel
+from transformers import (
+    AutoModel, AutoProcessor, 
+    CLIPModel, CLIPProcessor, 
+    ResNetModel, ViTMAEModel
+)
+
+# Optional imports for specific models
+try:
+    import timm
+except ImportError:
+    timm = None
+
+try:
+    import open_clip
+except ImportError:
+    open_clip = None
 
 # ========================================================
 # 1. Config, constants.
 # ========================================================
-EVAL_MODELS = {
+AVAILABLE_EVAL_MODELS = {
+    # --- Standard Models (Hugging Face) ---
     "ResNet50": "microsoft/resnet-50",
     "DINOv1":   "facebook/dino-vitb16",
     "DINOv2":   "facebook/dinov2-base",
     "CLIP":     "openai/clip-vit-base-patch16",
     "SigLIP":   "google/siglip-base-patch16-224",
+    
+    # --- Experimental / Robustness Check Models ---
+    "MAE":          "facebook/vit-mae-base", # ImageNet Unsupervised (Shape bias)
+    "SwAV":         "swav_resnet50",         # ImageNet Unsupervised (via Torch Hub)
+    
+    # --- OpenCLIP Models (Requires 'open_clip_torch') ---
+    # Format: "openclip:<model_name>:<pretrained_tag>"
+    
+    # LAION-2B Trained ViT
+    "OpenCLIP_ViT_B32": "openclip:ViT-B-32:laion2b_s34b_b79k",
+    "OpenCLIP_ViT_L14": "openclip:ViT-L-14:laion2b_s32b_b82k",
+    
+    # ResNet50 (Standard CLIP weights loaded via OpenCLIP)
+    "OpenCLIP_RN50":    "openclip:RN50:openai",
+    
+    # LAION-400M Trained ConvNeXt
+    "OpenCLIP_ConvNeXt": "openclip:convnext_base_w:laion400m_s13b_b51k",
 }
 
 GENERATOR_SOURCE_MAP = {
@@ -67,28 +100,37 @@ IMG_SIZE = 224
 MAX_REAL_TRAIN = 50
 MAX_REAL_TEST = 50
 
-# PyTorch Linear Probe Settings (L-BFGS Defaults)
-# L-BFGS typically works well with lr=1.0 and few steps
-PROBE_CONFIG = {
-    "epochs": 20,      # L-BFGS steps (each step has internal iterations)
-    "lr": 1.0,         # Standard LR for L-BFGS
-    "history_size": 100
+# Logistic Regression (LBFGS) Config
+LOGREG_CONFIG = {
+    "max_iter": 1000,
+    "C": 1.0,
+    "solver": "lbfgs",
 }
 
 # ========================================================
 # 2. Utilities.
 # ========================================================
 def load_probe_config(config_path):
-    global PROBE_CONFIG
+    global LOGREG_CONFIG
     if config_path and os.path.exists(config_path):
         print(f"Loading probe config from: {config_path}")
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 loaded_cfg = json.load(f)
-                PROBE_CONFIG.update(loaded_cfg)
+            if "max_iter" in loaded_cfg:
+                LOGREG_CONFIG["max_iter"] = int(loaded_cfg["max_iter"])
+            if "C" in loaded_cfg:
+                LOGREG_CONFIG["C"] = float(loaded_cfg["C"])
+            # Backward compatibility
+            if "epochs" in loaded_cfg and "max_iter" not in loaded_cfg:
+                LOGREG_CONFIG["max_iter"] = int(loaded_cfg["epochs"])
+            if "weight_decay" in loaded_cfg and "C" not in loaded_cfg:
+                wd = float(loaded_cfg["weight_decay"])
+                if wd > 0:
+                    LOGREG_CONFIG["C"] = float(1.0 / wd)
         except Exception as e:
             print(f"Error loading config file: {e}. Using defaults.")
-    print(f"Probe Config: {PROBE_CONFIG}")
+    print(f"LogReg Config: {LOGREG_CONFIG}")
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -103,14 +145,6 @@ def norm_name(s: str) -> str:
     s = re.sub(r"[^a-z0-9_]+", "", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return s
-
-class AddGaussianNoise(object):
-    def __init__(self, mean: float = 0.0, std: float = 1.0):
-        self.mean = mean
-        self.std = std
-
-    def __call__(self, tensor):
-        return tensor + torch.randn(tensor.size()) * self.std + self.mean
 
 class CustomImageDataset(Dataset):
     def __init__(self, image_paths, labels, transform):
@@ -141,65 +175,49 @@ class PilImageDataset(Dataset):
     def __getitem__(self, idx):
         return self.transform(self.images[idx]), self.labels[idx]
 
-class TensorDataset(Dataset):
-    def __init__(self, features, labels):
-        self.features = torch.from_numpy(features).float()
-        self.labels = torch.from_numpy(labels).long()
-
-    def __len__(self):
-        return len(self.features)
-
-    def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx]
-
 # ========================================================
 # 3. Real data loaders.
 # ========================================================
 def collect_imagenet_subset(dataset_name, split_name, target_ids, max_per_class, distractors=None):
     print(f"Connecting to {dataset_name} [{split_name}] stream...")
     try:
-        ds = load_dataset(dataset_name, split=split_name, streaming=True, trust_remote_code=True)
+        #ds = load_dataset(dataset_name, split=split_name, streaming=True, trust_remote_code=True)
+        ds = load_dataset(dataset_name, split=split_name, streaming=False, trust_remote_code=True)
     except Exception as e:
         print(f"Failed to load {dataset_name}. Error: {e}")
         return [], [], [], []
 
     collected_imgs, collected_lbls = [], []
     dist_imgs, dist_lbls = [], []
-
     counts = {k: 0 for k in target_ids.keys()}
     dist_counts = {k: 0 for k in (distractors.keys() if distractors else {})}
 
     print(f"Collecting images from {split_name} (Max {max_per_class}/class)...")
-
     for item in ds:
         lbl = item["label"]
         if lbl in target_ids and counts[lbl] < max_per_class:
             collected_imgs.append(item["image"].convert("RGB"))
             collected_lbls.append(target_ids[lbl])
             counts[lbl] += 1
-
         if distractors and lbl in distractors and dist_counts[lbl] < max_per_class:
             dist_imgs.append(item["image"].convert("RGB"))
             dist_lbls.append(lbl)
             dist_counts[lbl] += 1
-
         targets_done = all(c >= max_per_class for c in counts.values())
         dists_done = True
         if distractors:
             dists_done = all(c >= max_per_class for c in dist_counts.values())
         if targets_done and dists_done:
             break
-
     return collected_imgs, collected_lbls, dist_imgs, dist_lbls
 
 def load_cub_real_data_local(data_root, target_class_map, split="train", max_per_class=50):
     root = Path(data_root)
     images_dir = root / "images"
-
     if not images_dir.exists():
         print(f"[Error] 'images' directory not found in {data_root}")
         return [], []
-
+    
     real_folders = sorted([d.name for d in images_dir.iterdir() if d.is_dir()])
     real_id_to_folder = {}
     real_norm_to_folder = {}
@@ -214,52 +232,48 @@ def load_cub_real_data_local(data_root, target_class_map, split="train", max_per
 
     collected_imgs, collected_lbls = [], []
     print(f"Collecting CUB images (LOCAL) for [{split}] (Max {max_per_class}/class)...")
-
     for class_name, class_idx in tqdm(target_class_map.items(), desc="Loading Classes"):
         target_real_folder = None
         m = re.match(r"^(\d+)", class_name)
         if m:
             cid = int(m.group(1))
             target_real_folder = real_id_to_folder.get(cid)
-
         if not target_real_folder:
             name_part = class_name
-            if "_" in class_name: name_part = class_name.split("_", 1)[1]
-            elif "." in class_name: name_part = class_name.split(".", 1)[1]
+            if "_" in class_name:
+                name_part = class_name.split("_", 1)[1]
+            elif "." in class_name:
+                name_part = class_name.split(".", 1)[1]
             key = norm_name(name_part)
             target_real_folder = real_norm_to_folder.get(key)
-
-        if not target_real_folder: continue
+        if not target_real_folder:
+            continue
 
         class_dir = images_dir / target_real_folder
         img_files = sorted(list(class_dir.glob("*.jpg")))
-        
         count = 0
-        for img_path in img_files:
+        for i, img_path in enumerate(img_files):
             if count >= max_per_class: break
-            
             threshold = int(len(img_files) * 0.8)
-            idx = img_files.index(img_path)
-            is_target = (split == "train" and idx < threshold) or (split != "train" and idx >= threshold)
-            
-            if is_target:
-                try:
-                    img = Image.open(img_path).convert("RGB")
-                    collected_imgs.append(img)
-                    collected_lbls.append(class_idx)
-                    count += 1
-                except: pass
-
+            is_target = (split == "train" and i < threshold) or (split != "train" and i >= threshold)
+            if not is_target: continue
+            try:
+                img = Image.open(img_path).convert("RGB")
+                collected_imgs.append(img)
+                collected_lbls.append(class_idx)
+                count += 1
+            except Exception: pass
     return collected_imgs, collected_lbls
 
 def _infer_label_id_map_from_hf(ds, synthetic_class_map, dataset_name_tag="Dataset"):
     label_col = "label"
     if label_col not in ds.features:
         for c in ["fine_label", "coarse_label", "labels"]:
-            if c in ds.features: label_col = c; break
+            if c in ds.features:
+                label_col = c
+                break
     if label_col not in ds.features:
         raise ValueError(f"HF dataset has no label feature. Available: {list(ds.features.keys())}")
-
     label_feature = ds.features[label_col]
     hf_names = list(label_feature.names) if hasattr(label_feature, "names") else None
     num_labels = len(hf_names) if hf_names else int(ds[label_col].max()) + 1
@@ -269,43 +283,42 @@ def _infer_label_id_map_from_hf(ds, synthetic_class_map, dataset_name_tag="Datas
     for syn_class_name, internal_idx in synthetic_class_map.items():
         hf_id = None
         m = re.match(r"^(\d+)", syn_class_name)
-        if m and 0 <= int(m.group(1))-1 < num_labels:
-            hf_id = int(m.group(1))-1 
-        
+        if m and 0 <= int(m.group(1)) - 1 < num_labels:
+            hf_id = int(m.group(1)) - 1
         if hf_id is None and hf_norm_to_id:
             name_part = syn_class_name
-            if "_" in syn_class_name and m: name_part = re.split(r"[._]", syn_class_name, 1)[1]
-            elif "." in syn_class_name and m: name_part = syn_class_name.split(".", 1)[1]
+            if "_" in syn_class_name and m:
+                name_part = re.split(r"[._]", syn_class_name, 1)[1]
+            elif "." in syn_class_name and m:
+                name_part = syn_class_name.split(".", 1)[1]
             key = norm_name(name_part)
             hf_id = hf_norm_to_id.get(key)
-
         if hf_id is not None:
             syn_internal_to_hf_label[internal_idx] = hf_id
-
     return syn_internal_to_hf_label, label_col
 
 def load_real_data_hf_generic(hf_dataset, split, synthetic_class_map, max_per_class, seed=42, dataset_name_tag="Dataset"):
     print(f"Loading {dataset_name_tag} from HF. dataset={hf_dataset}, split={split}")
-    try: ds = load_dataset(hf_dataset, split=split)
-    except: ds = load_dataset(hf_dataset, split=split, trust_remote_code=True)
-
+    try:
+        ds = load_dataset(hf_dataset, split=split)
+    except Exception:
+        ds = load_dataset(hf_dataset, split=split, trust_remote_code=True)
     internal_to_hf, label_col = _infer_label_id_map_from_hf(ds, synthetic_class_map, dataset_name_tag)
     hf_to_internal = {v: k for k, v in internal_to_hf.items()}
-
     rng = random.Random(seed)
     indices = list(range(len(ds)))
     rng.shuffle(indices)
-
     counts = {k: 0 for k in internal_to_hf.keys()}
     images, labels = [], []
-
     for idx in indices:
         item = ds[idx]
         internal = hf_to_internal.get(int(item[label_col]))
         if internal is None or counts[internal] >= max_per_class: continue
         img = item["image"]
-        if not isinstance(img, Image.Image): img = Image.fromarray(np.array(img)).convert("RGB")
-        else: img = img.convert("RGB")
+        if not isinstance(img, Image.Image):
+            img = Image.fromarray(np.array(img)).convert("RGB")
+        else:
+            img = img.convert("RGB")
         images.append(img)
         labels.append(internal)
         counts[internal] += 1
@@ -324,57 +337,156 @@ def get_fewshot_subset(imgs, lbls, shots_per_class):
     return subset_imgs, subset_lbls
 
 # ========================================================
-# 4. Feature extractor & Linear Probe
+# 4. Feature extractor. (Updated for OpenCLIP & Normalization)
 # ========================================================
 class FeatureExtractor(nn.Module):
-    def __init__(self, model_name):
+    def __init__(self, model_identifier):
         super().__init__()
-        self.model_name = model_name
-        print(f"Loading model: {model_name} ...")
-        if "clip" in model_name and "siglip" not in model_name:
-            self.core = CLIPModel.from_pretrained(model_name)
-            self.processor = CLIPProcessor.from_pretrained(model_name)
-            self.type = "clip"
-        elif "siglip" in model_name:
-            self.core = AutoModel.from_pretrained(model_name)
-            self.processor = AutoProcessor.from_pretrained(model_name)
-            self.type = "siglip"
-        elif "resnet" in model_name:
-            self.core = ResNetModel.from_pretrained(model_name)
-            self.processor = AutoProcessor.from_pretrained(model_name)
-            self.type = "resnet"
+        self.model_identifier = model_identifier
+        self.type = "base"
+        self.processor = None
+        self.core = None
+        self.preprocess = None # For OpenCLIP / SwAV
+
+        print(f"Loading model: {model_identifier} ...")
+        
+        # --- A. OpenCLIP (via open_clip library) ---
+        if model_identifier.startswith("openclip:"):
+            if open_clip is None:
+                raise ImportError("Please install open_clip_torch: `pip install open_clip_torch`")
+            
+            # Parse: "openclip:ViT-B-32:laion2b_s34b_b79k"
+            try:
+                parts = model_identifier.split(":")
+                model_name = parts[1]
+                pretrained = parts[2]
+            except IndexError:
+                raise ValueError(f"Invalid OpenCLIP identifier format. Use 'openclip:model:pretrained'. Got: {model_identifier}")
+            
+            print(f"  -> OpenCLIP: name={model_name}, pretrained={pretrained}")
+            model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
+            self.core = model
+            self.preprocess = preprocess
+            self.type = "open_clip"
+
+        # --- B. SwAV (Torch Hub) ---
+        elif "swav" in model_identifier.lower():
+            print("  -> Loading SwAV from torch.hub (facebookresearch/swav)...")
+            try:
+                self.core = torch.hub.load('facebookresearch/swav:main', 'resnet50')
+            except Exception as e:
+                 # Fallback/Retry logic or detailed error
+                 print(f"  [Error] Failed to load SwAV via torch.hub: {e}")
+                 raise e
+            self.type = "swav"
+            # SwAV specific transform will be handled in get_transform
+
+        # --- C. Hugging Face Models ---
         else:
-            self.core = AutoModel.from_pretrained(model_name)
-            self.processor = AutoProcessor.from_pretrained(model_name)
-            self.type = "base_vit"
+            lower_name = model_identifier.lower()
+            if "clip" in lower_name and "siglip" not in lower_name:
+                self.core = CLIPModel.from_pretrained(model_identifier)
+                self.processor = CLIPProcessor.from_pretrained(model_identifier)
+                self.type = "hf_clip"
+            elif "siglip" in lower_name:
+                self.core = AutoModel.from_pretrained(model_identifier)
+                self.processor = AutoProcessor.from_pretrained(model_identifier)
+                self.type = "siglip"
+            elif "mae" in lower_name:
+                self.core = ViTMAEModel.from_pretrained(model_identifier)
+                self.processor = AutoProcessor.from_pretrained(model_identifier)
+                self.type = "mae"
+            elif "resnet" in lower_name:
+                self.core = ResNetModel.from_pretrained(model_identifier)
+                self.processor = AutoProcessor.from_pretrained(model_identifier)
+                self.type = "resnet"
+            else:
+                self.core = AutoModel.from_pretrained(model_identifier)
+                self.processor = AutoProcessor.from_pretrained(model_identifier)
+                self.type = "base_vit"
+            
         self.core.to(DEVICE)
         self.core.eval()
 
     def get_transform(self, augment=False):
-        def transform(image):
+        # 1. OpenCLIP
+        if self.type == "open_clip":
+            # If augment is True, we technically should recreate the transform,
+            # but for consistency we use the provided preprocess (eval mode) usually.
+            # If you specifically need augmentation for OpenCLIP during training probe,
+            # we can create a custom Compose. For now, returning preprocess is standard.
             if augment:
-                aug_pil = T.Compose([
-                    T.RandomResizedCrop(IMG_SIZE, scale=(0.8, 1.0), antialias=True),
-                    T.RandomHorizontalFlip(p=0.5),
-                    T.RandomAffine(degrees=10, translate=(0.1, 0.1)),
-                    T.ColorJitter(0.1, 0.1, 0.1, 0.05),
-                ])
-                image = aug_pil(image)
-            inputs = self.processor(images=image, return_tensors="pt")
-            return inputs["pixel_values"].squeeze(0)
-        return transform
+                # Custom Augment for OpenCLIP if needed, otherwise use preprocess
+                # (Preprocessing for OpenCLIP usually includes specific Resize/CenterCrop/Norm)
+                return self.preprocess 
+            return self.preprocess
+
+        # 2. Hugging Face Processor
+        if self.processor is not None:
+            def transform_hf(image):
+                if augment:
+                    aug_pil = T.Compose([
+                        T.RandomResizedCrop(IMG_SIZE, scale=(0.8, 1.0), antialias=True),
+                        T.RandomHorizontalFlip(p=0.5),
+                        T.ColorJitter(0.1, 0.1, 0.1, 0.05),
+                    ])
+                    image = aug_pil(image)
+                inputs = self.processor(images=image, return_tensors="pt")
+                return inputs["pixel_values"].squeeze(0)
+            return transform_hf
+
+        # 3. Manual Transform (SwAV, etc)
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+        if augment:
+            t_list = [
+                T.RandomResizedCrop(IMG_SIZE, scale=(0.8, 1.0), antialias=True),
+                T.RandomHorizontalFlip(p=0.5),
+                T.ColorJitter(0.1, 0.1, 0.1, 0.05),
+                T.ToTensor(),
+                T.Normalize(mean=mean, std=std)
+            ]
+        else:
+            t_list = [
+                T.Resize(256),
+                T.CenterCrop(IMG_SIZE),
+                T.ToTensor(),
+                T.Normalize(mean=mean, std=std)
+            ]
+        return T.Compose(t_list)
 
     def forward(self, pixel_values):
         with torch.no_grad():
             pixel_values = pixel_values.to(DEVICE)
-            if self.type in ["clip", "siglip"]:
+            
+            # --- Feature Extraction ---
+            if self.type == "open_clip":
+                # OpenCLIP encode_image
+                outputs = self.core.encode_image(pixel_values)
+
+            elif self.type == "hf_clip":
                 outputs = self.core.get_image_features(pixel_values=pixel_values)
+
+            elif self.type == "siglip":
+                outputs = self.core.get_image_features(pixel_values=pixel_values)
+            
+            elif self.type == "mae":
+                outputs = self.core(pixel_values=pixel_values).last_hidden_state[:, 0, :]
+                
+            elif self.type == "swav":
+                outputs = self.core(pixel_values)
+                
             elif self.type == "resnet":
                 out = self.core(pixel_values=pixel_values)
                 outputs = out.pooler_output.flatten(1)
-            else:
+                
+            else: # Base ViT / DINO
                 outputs = self.core(pixel_values=pixel_values).last_hidden_state[:, 0]
+            
+            # --- Common Normalization (Crucial Fix) ---
+            # Ensures all features are L2 normalized (unit sphere)
             outputs = outputs / outputs.norm(dim=-1, keepdim=True)
+            
             return outputs
 
 def extract_features_and_labels(model, dataloader):
@@ -383,67 +495,9 @@ def extract_features_and_labels(model, dataloader):
         f = model(imgs)
         feats.append(f.cpu().numpy())
         lbls.append(labels.numpy())
-    if not feats: return None, None
+    if not feats:
+        return None, None
     return np.concatenate(feats), np.concatenate(lbls)
-
-class LinearProbe(nn.Module):
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.fc = nn.Linear(input_dim, num_classes)
-    
-    def forward(self, x):
-        return self.fc(x)
-
-def train_linear_probe_and_track_loss(X_train, y_train, num_classes, epochs=None):
-    """
-    Train using Full-Batch L-BFGS to replicate sklearn-like convergence
-    while tracking loss history.
-    """
-    # Override epochs with config if not passed
-    n_epochs = epochs if epochs is not None else PROBE_CONFIG["epochs"]
-    
-    # Move all data to GPU (Full Batch)
-    X_tensor = torch.from_numpy(X_train).float().to(DEVICE)
-    y_tensor = torch.from_numpy(y_train).long().to(DEVICE)
-    
-    input_dim = X_train.shape[1]
-    model = LinearProbe(input_dim, num_classes).to(DEVICE)
-    
-    criterion = nn.CrossEntropyLoss()
-    
-    # L-BFGS Optimizer
-    optimizer = optim.LBFGS(model.parameters(), 
-                            lr=PROBE_CONFIG["lr"], 
-                            max_iter=20, 
-                            history_size=PROBE_CONFIG.get("history_size", 100))
-    
-    loss_history = []
-    model.train()
-    
-    def closure():
-        optimizer.zero_grad()
-        outputs = model(X_tensor)
-        loss = criterion(outputs, y_tensor)
-        loss.backward()
-        return loss
-
-    # print(f"  [L-BFGS] Start training for {n_epochs} steps...")
-    
-    for epoch in range(n_epochs):
-        # Optimizer step (performs multiple internal iterations)
-        loss = optimizer.step(closure)
-        
-        current_loss = loss.item()
-        loss_history.append(current_loss)
-        
-        # Early stopping check (if loss stabilizes)
-        if epoch > 5 and abs(loss_history[-2] - loss_history[-1]) < 1e-6:
-            # print(f"    Converged at step {epoch}")
-            # Fill remaining history for plotting consistency
-            loss_history.extend([current_loss] * (n_epochs - epoch - 1))
-            break
-            
-    return model, loss_history
 
 # ========================================================
 # 5. Visualization, evaluation.
@@ -482,12 +536,14 @@ def visualize_tsne(features_dict, labels_dict, title, save_path, class_names_map
             c_names = [k for k, v in class_names_map.items() if v == lbl]
             c_name = c_names[0] if c_names else str(lbl)
             plt.scatter(X_embedded[idx, 0], X_embedded[idx, 1], marker="o", alpha=0.3, label=f"Test Real {c_name}", s=30)
+
     mask_syn = (types == 1)
     for lbl in unique_labels:
         if lbl == -1: continue
         idx = (y == lbl) & mask_syn
         if np.any(idx):
             plt.scatter(X_embedded[idx, 0], X_embedded[idx, 1], marker="*", c="black", s=150, edgecolors="white", label="_nolegend_", zorder=10)
+
     mask_dist = (types == 2)
     if np.any(mask_dist):
         plt.scatter(X_embedded[mask_dist, 0], X_embedded[mask_dist, 1], marker="^", c="red", s=50, alpha=0.5, label="Distractors")
@@ -499,44 +555,38 @@ def visualize_tsne(features_dict, labels_dict, title, save_path, class_names_map
     plt.savefig(save_path)
     plt.close()
 
-def evaluate_per_class(model, X_test, y_test, id_to_class_name, generator_name, evaluator_name, output_dir):
-    model.eval()
-    test_dataset = TensorDataset(X_test, y_test)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    
-    all_preds, all_targets = [], []
-    with torch.no_grad():
-        for inputs, targets in test_loader:
-            inputs = inputs.to(DEVICE)
-            outputs = model(inputs)
-            preds = torch.argmax(outputs, dim=1).cpu().numpy()
-            all_preds.extend(preds)
-            all_targets.extend(targets.numpy())
-            
-    y_pred = np.array(all_preds)
-    y_true = np.array(all_targets)
-    overall_acc = accuracy_score(y_true, y_pred)
+def train_logreg_lbfgs(X_train, y_train):
+    clf = LogisticRegression(
+        max_iter=int(LOGREG_CONFIG["max_iter"]),
+        solver=str(LOGREG_CONFIG.get("solver", "lbfgs")),
+        C=float(LOGREG_CONFIG["C"]),
+        penalty="l2",
+        multi_class="auto",
+        n_jobs=None,
+    )
+    clf.fit(X_train, y_train)
+    return clf
 
-    # CM Save
+def evaluate_per_class_sklearn(clf, X_test, y_test, id_to_class_name, generator_name, evaluator_name, output_dir):
+    y_pred = clf.predict(X_test)
+    overall_acc = accuracy_score(y_test, y_pred)
     cm_dir = os.path.join(output_dir, "confusion_matrices")
     os.makedirs(cm_dir, exist_ok=True)
     unique_classes_all = sorted(list(id_to_class_name.keys()))
-    cm = confusion_matrix(y_true, y_pred, labels=unique_classes_all)
-    
+    cm = confusion_matrix(y_test, y_pred, labels=unique_classes_all)
     cm_cols = [id_to_class_name.get(i, str(i)) for i in unique_classes_all]
     cm_df = pd.DataFrame(cm, index=cm_cols, columns=cm_cols)
     cm_path = os.path.join(cm_dir, f"{evaluator_name}_{generator_name}.csv")
     cm_df.to_csv(cm_path)
-
     results = []
-    unique_classes = sorted(np.unique(y_true))
+    unique_classes = sorted(np.unique(y_test))
     acc_map = {}
     for cls_id in unique_classes:
-        mask = (y_true == cls_id)
+        mask = (y_test == cls_id)
         if np.sum(mask) == 0:
             acc_map[cls_id] = 0.0
             continue
-        cls_acc = (y_pred[mask] == y_true[mask]).mean()
+        cls_acc = (y_pred[mask] == y_test[mask]).mean()
         acc_map[cls_id] = float(cls_acc)
         cls_name = id_to_class_name.get(int(cls_id), str(cls_id))
         results.append({
@@ -545,13 +595,13 @@ def evaluate_per_class(model, X_test, y_test, id_to_class_name, generator_name, 
             "Class": cls_name,
             "Accuracy": float(cls_acc),
         })
-
     acc_vector = [acc_map[cid] for cid in unique_classes]
     return float(overall_acc), results, acc_vector, cm
 
 def calculate_complex_correlations(acc_store, experiments, output_dir):
     results = []
-    if "Real_Baseline" not in acc_store.get(STANDARD_EVALUATOR, {}): return
+    if "Real_Baseline" not in acc_store.get(STANDARD_EVALUATOR, {}):
+        return
     for gen_name in experiments.keys():
         source_models = GENERATOR_SOURCE_MAP.get(gen_name, [])
         for source_model in source_models:
@@ -560,7 +610,6 @@ def calculate_complex_correlations(acc_store, experiments, output_dir):
             vec_resnet_real = acc_store[STANDARD_EVALUATOR].get("Real_Baseline")
             vec_source_syn = acc_store[source_model].get(gen_name)
             vec_source_real = acc_store[source_model].get("Real_Baseline")
-
             row = {"Generator": gen_name, "Target_Source_Model": source_model}
             if vec_resnet_syn is not None and vec_resnet_real is not None:
                 corr, _ = spearmanr(vec_resnet_syn, vec_resnet_real)
@@ -574,7 +623,7 @@ def calculate_complex_correlations(acc_store, experiments, output_dir):
 
 def calculate_self_preference(final_results, output_dir):
     df = pd.DataFrame(final_results)
-    if 'Accuracy' not in df.columns: return
+    if "Accuracy" not in df.columns: return
     piv = df.pivot(index="Generator", columns="Evaluator", values="Accuracy")
     preference_results = []
     for gen_name in piv.index:
@@ -589,17 +638,17 @@ def calculate_self_preference(final_results, output_dir):
             preference_results.append({
                 "Generator": gen_name,
                 "Source_Model": source_model,
-                "Self_Score": self_score,
-                "Avg_Other_Score": avg_other_score,
-                "Self_Preference_Gap": gap
+                "Self_Score": float(self_score),
+                "Avg_Other_Score": float(avg_other_score),
+                "Self_Preference_Gap": float(gap),
             })
     if preference_results:
         pd.DataFrame(preference_results).to_csv(os.path.join(output_dir, "self_preference_policy.csv"), index=False)
 
 def calculate_confusion_matrix_similarity(cm_store, experiments, output_dir):
+    if STANDARD_EVALUATOR not in cm_store: return
     generators = list(cm_store[STANDARD_EVALUATOR].keys())
     sim_matrix_data = []
-    
     for gen1 in generators:
         row = {"Generator": gen1}
         cm1 = cm_store[STANDARD_EVALUATOR][gen1].flatten()
@@ -607,14 +656,14 @@ def calculate_confusion_matrix_similarity(cm_store, experiments, output_dir):
         for gen2 in generators:
             cm2 = cm_store[STANDARD_EVALUATOR][gen2].flatten()
             norm2 = np.linalg.norm(cm2)
-            if norm1 > 0 and norm2 > 0: sim = np.dot(cm1, cm2) / (norm1 * norm2)
+            if norm1 > 0 and norm2 > 0:
+                sim = float(np.dot(cm1, cm2) / (norm1 * norm2))
             else: sim = 0.0
             row[gen2] = sim
         sim_matrix_data.append(row)
-        
     pd.DataFrame(sim_matrix_data).to_csv(os.path.join(output_dir, "confusion_matrix_similarity_matrix.csv"), index=False)
     print(f"\n[Success] CM Similarity Matrix saved.")
-
+    
     policy_results = []
     for gen_name in experiments.keys():
         source_models = GENERATOR_SOURCE_MAP.get(gen_name, [])
@@ -626,7 +675,7 @@ def calculate_confusion_matrix_similarity(cm_store, experiments, output_dir):
                 f1 = cm_source_syn.flatten()
                 f2 = cm_source_real.flatten()
                 if np.linalg.norm(f1) > 0 and np.linalg.norm(f2) > 0:
-                    sim = np.dot(f1, f2) / (np.linalg.norm(f1) * np.linalg.norm(f2))
+                    sim = float(np.dot(f1, f2) / (np.linalg.norm(f1) * np.linalg.norm(f2)))
                     policy_results.append({
                         "Generator": gen_name,
                         "Target_Source_Model": source_model,
@@ -634,27 +683,6 @@ def calculate_confusion_matrix_similarity(cm_store, experiments, output_dir):
                     })
     if policy_results:
         pd.DataFrame(policy_results).to_csv(os.path.join(output_dir, "confusion_matrix_policy_consistency.csv"), index=False)
-
-def save_loss_metrics(loss_store, output_dir):
-    df_history = pd.DataFrame(loss_store)
-    df_history.index.name = "Step"
-    df_history.to_csv(os.path.join(output_dir, "training_loss_history.csv"))
-    
-    metrics = []
-    for gen_name, losses in loss_store.items():
-        initial = losses[0]
-        final = losses[-1]
-        decay = initial - final
-        slope_5 = (losses[0] - losses[min(4, len(losses)-1)])
-        metrics.append({
-            "Generator": gen_name,
-            "Initial_Loss": initial,
-            "Final_Loss": final,
-            "Total_Drop": decay,
-            "Early_Drop_Slope": slope_5
-        })
-    pd.DataFrame(metrics).to_csv(os.path.join(output_dir, "learning_efficiency_metrics.csv"), index=False)
-    print("\n[Success] Loss history and metrics saved.")
 
 # ========================================================
 # 6. Main.
@@ -676,19 +704,43 @@ def main():
     parser.add_argument("--imagenet_hf_train_split", type=str, default="train")
     parser.add_argument("--imagenet_hf_test_split", type=str, default="validation")
     parser.add_argument("--real_data_dir", type=str, default=None)
-    parser.add_argument("--config", type=str, default=None, help="Path to JSON config file for probe training")
+    parser.add_argument("--config", type=str, default=None, help="Path to JSON config file for LogReg")
+    
+    # Filter Evaluators
+    parser.add_argument("--evaluators", type=str, nargs="+", default=None, 
+                        help="List of evaluators to use. If not specified, all models are used.")
+    
+    # [NEW] TSNE Toggle
+    parser.add_argument("--no_tsne", action="store_true", help="Skip t-SNE visualization to save memory and avoid crashes.")
+    
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(SEED)
-    if args.config: load_probe_config(args.config)
+    if args.config:
+        load_probe_config(args.config)
+    
+    # Filter Evaluators
+    eval_models_to_run = {}
+    if args.evaluators:
+        print(f"User requested specific evaluators: {args.evaluators}")
+        for req_name in args.evaluators:
+            if req_name in AVAILABLE_EVAL_MODELS:
+                eval_models_to_run[req_name] = AVAILABLE_EVAL_MODELS[req_name]
+            else:
+                print(f"[Warning] Requested evaluator '{req_name}' not found in AVAILABLE_EVAL_MODELS.")
+    else:
+        eval_models_to_run = AVAILABLE_EVAL_MODELS
+
     print(f"Dataset: {args.dataset_type}, Augmentation: {args.augment}")
+    print(f"Evaluators to run: {list(eval_models_to_run.keys())}")
+    print(f"Skip t-SNE: {args.no_tsne}")
 
     root = Path(args.dataset_dir)
     class_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
     class_map = {d.name: i for i, d in enumerate(class_dirs)}
     id_to_class_name = {v: k for k, v in class_map.items()}
-    
+
     experiments = {}
     syn_shots_per_class = 0
     for c_name, c_idx in class_map.items():
@@ -699,13 +751,15 @@ def main():
                 for img in m_dir.glob("*.png"):
                     experiments[exp_name]["paths"].append(str(img))
                     experiments[exp_name]["labels"].append(c_idx)
-    
+
     if len(experiments) > 0:
         first_exp = list(experiments.values())[0]
-        if len(class_map) > 0: syn_shots_per_class = len(first_exp["paths"]) // len(class_map)
+        if len(class_map) > 0:
+            syn_shots_per_class = len(first_exp["paths"]) // len(class_map)
         print(f"Detected synthetic shots per class: {syn_shots_per_class}")
     else:
-        print("No experiments found."); return
+        print("No experiments found.")
+        return
 
     real_test_imgs, real_test_lbls = [], []
     real_train_imgs, real_train_lbls = [], []
@@ -715,115 +769,122 @@ def main():
         target_ids = {}
         for k, v in class_map.items():
             try: target_ids[int(k.split("_")[0])] = v
-            except: pass
+            except Exception: pass
         real_test_imgs, real_test_lbls, dist_imgs, dist_lbls = collect_imagenet_subset(
             args.imagenet_hf_dataset, args.imagenet_hf_test_split, target_ids, MAX_REAL_TEST, DISTRACTOR_IDS)
         real_train_imgs, real_train_lbls, _, _ = collect_imagenet_subset(
             args.imagenet_hf_dataset, args.imagenet_hf_train_split, target_ids, MAX_REAL_TRAIN, None)
+
     elif args.dataset_type == "cub":
         if args.cub_source == "hf":
             real_train_imgs, real_train_lbls = load_real_data_hf_generic(
                 args.cub_hf_dataset, args.cub_hf_train_split, class_map, MAX_REAL_TRAIN, SEED, "CUB")
             real_test_imgs, real_test_lbls = load_real_data_hf_generic(
-                args.cub_hf_dataset, args.cub_hf_test_split, class_map, MAX_REAL_TEST, SEED+1, "CUB")
+                args.cub_hf_dataset, args.cub_hf_test_split, class_map, MAX_REAL_TEST, SEED + 1, "CUB")
         else:
-            real_train_imgs, real_train_lbls = load_cub_real_data_local(args.real_data_dir, class_map, "train", MAX_REAL_TRAIN)
-            real_test_imgs, real_test_lbls = load_cub_real_data_local(args.real_data_dir, class_map, "validation", MAX_REAL_TEST)
+            real_train_imgs, real_train_lbls = load_cub_real_data_local(
+                args.real_data_dir, class_map, "train", MAX_REAL_TRAIN)
+            real_test_imgs, real_test_lbls = load_cub_real_data_local(
+                args.real_data_dir, class_map, "validation", MAX_REAL_TEST)
+
     elif args.dataset_type == "food101":
         real_train_imgs, real_train_lbls = load_real_data_hf_generic(
             args.food_hf_dataset, args.food_hf_train_split, class_map, MAX_REAL_TRAIN, SEED, "Food101")
         real_test_imgs, real_test_lbls = load_real_data_hf_generic(
-            args.food_hf_dataset, args.food_hf_test_split, class_map, MAX_REAL_TEST, SEED+1, "Food101")
+            args.food_hf_dataset, args.food_hf_test_split, class_map, MAX_REAL_TEST, SEED + 1, "Food101")
 
     real_fewshot_imgs, real_fewshot_lbls = get_fewshot_subset(real_train_imgs, real_train_lbls, syn_shots_per_class)
 
     final_results = []
     class_wise_results = []
-    acc_store = {model_name: {} for model_name in EVAL_MODELS.keys()}
-    cm_store = {model_name: {} for model_name in EVAL_MODELS.keys()}
-    loss_store_resnet = {} 
+    acc_store = {model_name: {} for model_name in AVAILABLE_EVAL_MODELS.keys()}
+    cm_store = {model_name: {} for model_name in AVAILABLE_EVAL_MODELS.keys()}
 
-    for eval_name, model_id in EVAL_MODELS.items():
+    # === Main Evaluation Loop using Filtered Models ===
+    for eval_name, model_id in eval_models_to_run.items():
         print(f"\n--- Judge: {eval_name} ---")
-        extractor = FeatureExtractor(model_id)
+        try:
+            extractor = FeatureExtractor(model_id)
+        except Exception as e:
+            print(f"Skipping {eval_name} due to load error: {e}")
+            continue
+
         transform_eval = extractor.get_transform(augment=False)
         transform_train = extractor.get_transform(augment=args.augment)
         if len(real_test_imgs) == 0: continue
 
+        # TEST
         test_ds = PilImageDataset(real_test_imgs, real_test_lbls, transform_eval)
         test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
         X_test, y_test = extract_features_and_labels(extractor, test_loader)
-        
+
+        # Distractor (for TSNE only)
         X_dist = None
-        if dist_imgs:
+        if dist_imgs and not args.no_tsne:
             dist_ds = PilImageDataset(dist_imgs, dist_lbls, transform_eval)
             dist_loader = DataLoader(dist_ds, batch_size=BATCH_SIZE)
             X_dist, _ = extract_features_and_labels(extractor, dist_loader)
 
+        # Real Baseline
         if len(real_train_imgs) > 0:
             train_real_ds = PilImageDataset(real_train_imgs, real_train_lbls, transform_train)
             train_real_loader = DataLoader(train_real_ds, batch_size=BATCH_SIZE, shuffle=True)
             X_train_real, y_train_real = extract_features_and_labels(extractor, train_real_loader)
-            
-            clf_model, loss_hist = train_linear_probe_and_track_loss(X_train_real, y_train_real, len(class_map))
-            
-            if eval_name == STANDARD_EVALUATOR: loss_store_resnet["Real_Baseline"] = loss_hist
 
-            acc, cls_res, acc_vec, cm = evaluate_per_class(
-                clf_model, X_test, y_test, id_to_class_name, "Real_Baseline", eval_name, args.output_dir
+            clf = train_logreg_lbfgs(X_train_real, y_train_real)
+            acc, cls_res, acc_vec, cm = evaluate_per_class_sklearn(
+                clf, X_test, y_test, id_to_class_name, "Real_Baseline", eval_name, args.output_dir
             )
             class_wise_results.extend(cls_res)
             acc_store[eval_name]["Real_Baseline"] = acc_vec
             cm_store[eval_name]["Real_Baseline"] = cm
             final_results.append({"Generator": "Real_Baseline", "Evaluator": eval_name, "Accuracy": acc})
-            
-            tsne_dir = os.path.join(args.output_dir, "tsne_plots", eval_name)
-            feats_dict = {"Real": X_test, "Train": X_train_real}
-            lbls_dict = {"Real": y_test, "Train": y_train_real}
-            if X_dist is not None: feats_dict["Distractor"] = X_dist
-            visualize_tsne(feats_dict, lbls_dict, f"Real Baseline ({eval_name})", os.path.join(tsne_dir, "Baseline.png"), class_map)
 
+            if not args.no_tsne:
+                tsne_dir = os.path.join(args.output_dir, "tsne_plots", eval_name)
+                feats_dict = {"Real": X_test, "Train": X_train_real}
+                lbls_dict = {"Real": y_test, "Train": y_train_real}
+                if X_dist is not None: feats_dict["Distractor"] = X_dist
+                visualize_tsne(feats_dict, lbls_dict, f"Real Baseline ({eval_name})", os.path.join(tsne_dir, "Baseline.png"), class_map)
+
+        # Real Few-shot
         if len(real_fewshot_imgs) > 0:
             train_few_ds = PilImageDataset(real_fewshot_imgs, real_fewshot_lbls, transform_train)
             train_few_loader = DataLoader(train_few_ds, batch_size=BATCH_SIZE, shuffle=True)
             X_train_few, y_train_few = extract_features_and_labels(extractor, train_few_loader)
-            
-            clf_model, loss_hist = train_linear_probe_and_track_loss(X_train_few, y_train_few, len(class_map))
-            
-            if eval_name == STANDARD_EVALUATOR: loss_store_resnet["Real_FewShot"] = loss_hist
 
-            acc, cls_res, acc_vec, cm = evaluate_per_class(
-                clf_model, X_test, y_test, id_to_class_name, "Real_FewShot", eval_name, args.output_dir
+            clf = train_logreg_lbfgs(X_train_few, y_train_few)
+            acc, cls_res, acc_vec, cm = evaluate_per_class_sklearn(
+                clf, X_test, y_test, id_to_class_name, "Real_FewShot", eval_name, args.output_dir
             )
             class_wise_results.extend(cls_res)
             acc_store[eval_name]["Real_FewShot"] = acc_vec
             cm_store[eval_name]["Real_FewShot"] = cm
             final_results.append({"Generator": "Real_FewShot", "Evaluator": eval_name, "Accuracy": acc})
 
+        # Synthetic Generators
         for exp_name, data in experiments.items():
             train_ds = CustomImageDataset(data["paths"], data["labels"], transform_train)
             if len(train_ds) < len(class_map): continue
             train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
             X_syn, y_syn = extract_features_and_labels(extractor, train_loader)
             if X_syn is None: continue
-            
-            clf_model, loss_hist = train_linear_probe_and_track_loss(X_syn, y_syn, len(class_map))
-            
-            if eval_name == STANDARD_EVALUATOR: loss_store_resnet[exp_name] = loss_hist
 
-            acc, cls_res, acc_vec, cm = evaluate_per_class(
-                clf_model, X_test, y_test, id_to_class_name, exp_name, eval_name, args.output_dir
+            clf = train_logreg_lbfgs(X_syn, y_syn)
+            acc, cls_res, acc_vec, cm = evaluate_per_class_sklearn(
+                clf, X_test, y_test, id_to_class_name, exp_name, eval_name, args.output_dir
             )
             class_wise_results.extend(cls_res)
             acc_store[eval_name][exp_name] = acc_vec
             cm_store[eval_name][exp_name] = cm
             final_results.append({"Generator": exp_name, "Evaluator": eval_name, "Accuracy": acc})
-            
-            tsne_path = os.path.join(args.output_dir, "tsne_plots", eval_name, f"{exp_name}.png")
-            feats_dict = {"Real": X_test, "Train": X_syn}
-            lbls_dict = {"Real": y_test, "Train": y_syn}
-            if X_dist is not None: feats_dict["Distractor"] = X_dist
-            visualize_tsne(feats_dict, lbls_dict, f"{exp_name} ({eval_name})", tsne_path, class_map)
+
+            if not args.no_tsne:
+                tsne_path = os.path.join(args.output_dir, "tsne_plots", eval_name, f"{exp_name}.png")
+                feats_dict = {"Real": X_test, "Train": X_syn}
+                lbls_dict = {"Real": y_test, "Train": y_syn}
+                if X_dist is not None: feats_dict["Distractor"] = X_dist
+                visualize_tsne(feats_dict, lbls_dict, f"{exp_name} ({eval_name})", tsne_path, class_map)
 
         del extractor
         torch.cuda.empty_cache()
@@ -831,6 +892,28 @@ def main():
     if final_results:
         df = pd.DataFrame(final_results)
         piv = df.pivot(index="Generator", columns="Evaluator", values="Accuracy")
+        
+        # --- [NEW] Custom Sort Order ---
+        ROW_ORDER = [
+            "Real_Baseline",
+            "Real_FewShot",
+            "Only_V1",
+            "Only_V2",
+            "Only_CLIP",
+            "Only_SigLIP",
+            "Family_DINO",
+            "Family_CLIP",
+            "Hybrid_V1_CLIP",
+            "Hybrid_V1_SigLIP",
+            "Hybrid_V2_CLIP",
+            "Hybrid_V2_SigLIP"
+        ]
+        # Only reindex with rows that actually exist in the results
+        final_order = [r for r in ROW_ORDER if r in piv.index]
+        remaining = [r for r in piv.index if r not in final_order]
+        piv = piv.reindex(final_order + remaining)
+        # -------------------------------
+
         csv_path = os.path.join(args.output_dir, "final_results.csv")
         piv.to_csv(csv_path)
         print(f"\nSaved overall results to {csv_path}")
@@ -842,7 +925,6 @@ def main():
     print("\n--- Calculating Metrics ---")
     calculate_complex_correlations(acc_store, experiments, args.output_dir)
     calculate_confusion_matrix_similarity(cm_store, experiments, args.output_dir)
-    if loss_store_resnet: save_loss_metrics(loss_store_resnet, args.output_dir)
 
 if __name__ == "__main__":
     main()

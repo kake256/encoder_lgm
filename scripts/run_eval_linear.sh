@@ -2,57 +2,60 @@
 set -euo pipefail
 
 # ========================================================
-# User config, augmentation default.
+# User Configuration
 # ========================================================
-ENABLE_AUGMENTATION="true"
 
-# --- Training Hyperparameters (Linear Probe) ---
-PROBE_EPOCHS=30
-PROBE_LR=0.005
-PROBE_MOMENTUM=0.9
-PROBE_WEIGHT_DECAY=0.0001
+# --- 1. Evaluator Models Selection ---
+# 混同行列の類似度(Policy_3)を出すため、Generatorモデル(DINO, CLIP等)も含めることを推奨します。
+#SELECTED_EVALUATORS="ResNet50 DINOv1 DINOv2 CLIP SigLIP OpenCLIP_ViT_B32 OpenCLIP_RN50 OpenCLIP_ConvNeXt MAE SwAV"
+SELECTED_EVALUATORS="ResNet50 OpenCLIP_ViT_B32 OpenCLIP_RN50 OpenCLIP_ConvNeXt"
 
-# ========================================================
-# Path resolution.
-# ========================================================
+# --- 2. Augmentation & Visualization ---
+ENABLE_AUGMENTATION="false"
+# t-SNEの可視化 (メモリ不足やクラッシュ回避のため false 推奨)
+ENABLE_TSNE="false"
+
+# --- 3. Dataset Path ---
+# Pythonスクリプトの場所 (適宜変更してください)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 PYTHON_SCRIPT="$PROJECT_ROOT/src/evaluate_linear.py"
 
-# Default synthetic dataset path
-#DEFAULT_DATASET_DIR="$PROJECT_ROOT/makeData/dataset_clean"
-DEFAULT_DATASET_DIR="$PROJECT_ROOT/makeData/dataset_clean_food101"
+# 合成データセットの場所
+#DEFAULT_DATASET_DIR="$PROJECT_ROOT/makeData_midmid/dataset_clean"
+DEFAULT_DATASET_DIR="$PROJECT_ROOT/makeData/dataset_clean"
 
-# Dataset selection defaults.
-#DEFAULT_DATASET_TYPE="imagenet"
-DEFAULT_DATASET_TYPE="food101"
+# --- 4. Training Hyperparameters (Logistic Regression) ---
+LOGREG_MAX_ITER=1000
+LOGREG_C=1.0
 
-# --------------------------------------------------------
+# ========================================================
+# Path resolution & Defaults
+# ========================================================
+DEFAULT_DATASET_TYPE="imagenet"
+
 # CUB Settings
-# --------------------------------------------------------
 DEFAULT_CUB_SOURCE="hf"
 DEFAULT_CUB_HF_DATASET="Donghyun99/CUB-200-2011"
 DEFAULT_CUB_HF_TRAIN_SPLIT="train"
 DEFAULT_CUB_HF_TEST_SPLIT="test"
 DEFAULT_CUB_REAL_DATA_DIR="$PROJECT_ROOT/data/CUB_200_2011"
 
-# --------------------------------------------------------
 # Food101 Settings
-# --------------------------------------------------------
 DEFAULT_FOOD_HF_DATASET="ethz/food101"
 DEFAULT_FOOD_HF_TRAIN_SPLIT="train"
 DEFAULT_FOOD_HF_TEST_SPLIT="validation"
 
-# --------------------------------------------------------
 # ImageNet Settings
-# --------------------------------------------------------
 DEFAULT_IMAGENET_HF_DATASET="imagenet-1k"
 DEFAULT_IMAGENET_HF_TRAIN_SPLIT="train"
 DEFAULT_IMAGENET_HF_TEST_SPLIT="validation"
 
 # ========================================================
-# Apply augmentation default.
+# Internal Logic
 # ========================================================
+
+# Augmentation Flag
 if [ "$ENABLE_AUGMENTATION" = "true" ]; then
   AUGMENT_FLAG="--augment"
   AUGMENT_STATUS="ON (Config)"
@@ -61,11 +64,19 @@ else
   AUGMENT_STATUS="OFF"
 fi
 
-# ========================================================
-# Args parsing.
-# ========================================================
+# TSNE Flag
+if [ "$ENABLE_TSNE" = "false" ]; then
+  TSNE_FLAG="--no_tsne"
+  TSNE_STATUS="OFF (Skipped)"
+else
+  TSNE_FLAG=""
+  TSNE_STATUS="ON"
+fi
+
+# Args Parsing
 DATASET_DIR="$DEFAULT_DATASET_DIR"
 DATASET_TYPE="$DEFAULT_DATASET_TYPE"
+EVALUATORS="$SELECTED_EVALUATORS"
 
 # CUB vars
 CUB_SOURCE="$DEFAULT_CUB_SOURCE"
@@ -84,7 +95,6 @@ IMAGENET_HF_DATASET="$DEFAULT_IMAGENET_HF_DATASET"
 IMAGENET_HF_TRAIN_SPLIT="$DEFAULT_IMAGENET_HF_TRAIN_SPLIT"
 IMAGENET_HF_TEST_SPLIT="$DEFAULT_IMAGENET_HF_TEST_SPLIT"
 
-# Config file path (optional)
 CONFIG_FILE=""
 
 while [[ "$#" -gt 0 ]]; do
@@ -92,6 +102,10 @@ while [[ "$#" -gt 0 ]]; do
     -a|--augment)
       AUGMENT_FLAG="--augment"
       AUGMENT_STATUS="ON (Argument)"
+      ;;
+    --no_tsne)
+      TSNE_FLAG="--no_tsne"
+      TSNE_STATUS="OFF (Argument)"
       ;;
     -t|--type)
       if [[ -n "${2:-}" && "$2" != -* ]]; then
@@ -102,10 +116,21 @@ while [[ "$#" -gt 0 ]]; do
         exit 1
       fi
       ;;
+    --evaluators)
+      if [[ -n "${2:-}" && "$2" != -* ]]; then
+        EVALUATORS="$2"
+        shift
+      else
+        echo "Error: Argument for $1 is missing"
+        exit 1
+      fi
+      ;;
     --config)
       if [[ -n "${2:-}" && "$2" != -* ]]; then CONFIG_FILE="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
-      
-    # --- CUB Args ---
+    --max_iter)
+      if [[ -n "${2:-}" && "$2" != -* ]]; then LOGREG_MAX_ITER="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
+    --C)
+      if [[ -n "${2:-}" && "$2" != -* ]]; then LOGREG_C="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
     --cub_source)
       if [[ -n "${2:-}" && "$2" != -* ]]; then CUB_SOURCE="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
     --cub_hf_dataset)
@@ -116,30 +141,20 @@ while [[ "$#" -gt 0 ]]; do
       if [[ -n "${2:-}" && "$2" != -* ]]; then CUB_HF_TEST_SPLIT="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
     -r|--real_dir)
       if [[ -n "${2:-}" && "$2" != -* ]]; then REAL_DATA_DIR="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
-    
-    # --- Food101 Args ---
     --food_hf_dataset)
       if [[ -n "${2:-}" && "$2" != -* ]]; then FOOD_HF_DATASET="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
     --food_hf_train_split)
       if [[ -n "${2:-}" && "$2" != -* ]]; then FOOD_HF_TRAIN_SPLIT="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
     --food_hf_test_split)
       if [[ -n "${2:-}" && "$2" != -* ]]; then FOOD_HF_TEST_SPLIT="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
-
-    # --- ImageNet Args ---
     --imagenet_hf_dataset)
       if [[ -n "${2:-}" && "$2" != -* ]]; then IMAGENET_HF_DATASET="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
     --imagenet_hf_train_split)
       if [[ -n "${2:-}" && "$2" != -* ]]; then IMAGENET_HF_TRAIN_SPLIT="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
     --imagenet_hf_test_split)
       if [[ -n "${2:-}" && "$2" != -* ]]; then IMAGENET_HF_TEST_SPLIT="$2"; shift; else echo "Error: Arg missing for $1"; exit 1; fi ;;
-
     -*)
       echo "Unknown option: $1"
-      echo "Usage:"
-      echo "  bash run_eval_linear.sh [dataset_path] [-a|--augment] [--type|-t imagenet|cub|food101]"
-      echo "    For CUB(HF):    [--cub_source hf] [--cub_hf_dataset ID] ..."
-      echo "    For Food101:    [--food_hf_dataset ID] [--food_hf_train_split train] [--food_hf_test_split validation]"
-      echo "    For ImageNet:   [--imagenet_hf_dataset ID] [--imagenet_hf_train_split train] [--imagenet_hf_test_split validation]"
       exit 1
       ;;
     *)
@@ -149,30 +164,26 @@ while [[ "$#" -gt 0 ]]; do
   shift
 done
 
-# ========================================================
-# Output dir.
-# ========================================================
+# Output Dir
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="$PROJECT_ROOT/evaluation_results_critique/${TIMESTAMP}"
 mkdir -p "$OUTPUT_DIR"
 
-# ========================================================
-# Config generation (if not provided externally)
-# ========================================================
+# Generate Config
 if [ -z "$CONFIG_FILE" ]; then
   CONFIG_FILE="$OUTPUT_DIR/probe_config.json"
   echo "{
-    \"epochs\": $PROBE_EPOCHS,
-    \"lr\": $PROBE_LR,
-    \"momentum\": $PROBE_MOMENTUM,
-    \"weight_decay\": $PROBE_WEIGHT_DECAY
+    \"max_iter\": $LOGREG_MAX_ITER,
+    \"C\": $LOGREG_C
   }" > "$CONFIG_FILE"
-  echo "Generated config file: $CONFIG_FILE"
 fi
 
-# ========================================================
-# Preflight.
-# ========================================================
+# Prepare Evaluator Args
+EVAL_ARGS=()
+if [ -n "$EVALUATORS" ]; then
+  EVAL_ARGS+=(--evaluators $EVALUATORS)
+fi
+
 echo "========================================================"
 echo " Critical Evaluation Pipeline"
 echo "========================================================"
@@ -181,26 +192,9 @@ echo " Python Script        : $PYTHON_SCRIPT"
 echo " Syn Dataset Path     : $DATASET_DIR"
 echo " Output Path          : $OUTPUT_DIR"
 echo " Data Augmentation    : $AUGMENT_STATUS"
+echo " t-SNE Visualization  : $TSNE_STATUS"
+echo " Selected Evaluators  : ${EVALUATORS:-All (Default)}"
 echo " Config File          : $CONFIG_FILE"
-echo " --------------------------------------------------------"
-echo " Dataset Type         : $DATASET_TYPE"
-
-if [ "$DATASET_TYPE" = "cub" ]; then
-  echo " CUB Source           : $CUB_SOURCE"
-  if [ "$CUB_SOURCE" = "hf" ]; then
-    echo " CUB HF Dataset       : $CUB_HF_DATASET"
-  else
-    echo " CUB Local Real Dir   : $REAL_DATA_DIR"
-  fi
-elif [ "$DATASET_TYPE" = "food101" ]; then
-  echo " Food HF Dataset      : $FOOD_HF_DATASET"
-  echo " Food HF Train Split  : $FOOD_HF_TRAIN_SPLIT"
-  echo " Food HF Test Split   : $FOOD_HF_TEST_SPLIT"
-elif [ "$DATASET_TYPE" = "imagenet" ]; then
-  echo " ImageNet HF Dataset  : $IMAGENET_HF_DATASET"
-  echo " ImageNet Train Split : $IMAGENET_HF_TRAIN_SPLIT"
-  echo " ImageNet Test Split  : $IMAGENET_HF_TEST_SPLIT"
-fi
 echo "========================================================"
 
 if [ ! -f "$PYTHON_SCRIPT" ]; then
@@ -213,11 +207,9 @@ if [ ! -d "$DATASET_DIR" ]; then
   exit 1
 fi
 
-# ========================================================
-# Run.
-# ========================================================
-echo ">>> Installing Dependencies (if needed)..."
-pip install transformers datasets scikit-learn pandas matplotlib sentencepiece tqdm pillow torchvision --quiet
+echo ">>> Installing Dependencies..."
+# ↓ コメントアウトしました
+# pip install transformers datasets scikit-learn pandas matplotlib sentencepiece tqdm pillow torchvision timm open_clip_torch --quiet
 
 echo ">>> Running Python Evaluation..."
 
@@ -225,6 +217,8 @@ if [ "$DATASET_TYPE" = "cub" ]; then
   python3 "$PYTHON_SCRIPT" "$DATASET_DIR" \
     --output_dir "$OUTPUT_DIR" \
     $AUGMENT_FLAG \
+    $TSNE_FLAG \
+    "${EVAL_ARGS[@]}" \
     --dataset_type "$DATASET_TYPE" \
     --cub_source "$CUB_SOURCE" \
     --cub_hf_dataset "$CUB_HF_DATASET" \
@@ -234,10 +228,11 @@ if [ "$DATASET_TYPE" = "cub" ]; then
     --config "$CONFIG_FILE"
 
 elif [ "$DATASET_TYPE" = "food101" ]; then
-  # Food101 execution
   python3 "$PYTHON_SCRIPT" "$DATASET_DIR" \
     --output_dir "$OUTPUT_DIR" \
     $AUGMENT_FLAG \
+    $TSNE_FLAG \
+    "${EVAL_ARGS[@]}" \
     --dataset_type "$DATASET_TYPE" \
     --food_hf_dataset "$FOOD_HF_DATASET" \
     --food_hf_train_split "$FOOD_HF_TRAIN_SPLIT" \
@@ -245,10 +240,11 @@ elif [ "$DATASET_TYPE" = "food101" ]; then
     --config "$CONFIG_FILE"
 
 else
-  # ImageNet execution
   python3 "$PYTHON_SCRIPT" "$DATASET_DIR" \
     --output_dir "$OUTPUT_DIR" \
     $AUGMENT_FLAG \
+    $TSNE_FLAG \
+    "${EVAL_ARGS[@]}" \
     --dataset_type "$DATASET_TYPE" \
     --imagenet_hf_dataset "$IMAGENET_HF_DATASET" \
     --imagenet_hf_train_split "$IMAGENET_HF_TRAIN_SPLIT" \
@@ -260,3 +256,4 @@ echo "========================================================"
 echo " All Done."
 echo " Results are saved in: $OUTPUT_DIR"
 echo "========================================================"
+

@@ -5,6 +5,9 @@ Data/
 data/
 makeData/
 makeData_old/
+ft_results/
+hf_datasets_cache/
+mixed_ft_results/
 
 # 結果・出力・ログ関連
 classification_results/
