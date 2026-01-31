@@ -1,6 +1,7 @@
 # ファイル名: evaluate_linear2.py
 # 内容: エントリーポイント. 実験のセットアップ, ループ実行, 結果の保存を担当
-# 修正: mode="scratch" の場合に FeatureExtractor へ pretrained=False を渡すロジックを追加
+# 修正: mode="scratch" の場合に FeatureExtractor へ pretrained=False を渡すロジック
+# 修正: get_transform に mode を渡し、Augmentationの強弱を自動調整
 
 import os
 import math
@@ -166,15 +167,17 @@ def main():
     for eval_name, model_id in eval_models.items():
         print(f"\n[{eval_name}] Init...")
         try:
-            # 【重要修正】 mode が "scratch" の場合は pretrained=False に設定する
+            # mode が "scratch" の場合は pretrained=False に設定する
             is_pretrained = (mode != "scratch")
             extractor = FeatureExtractor(model_id, pretrained=is_pretrained)
         except Exception as e:
             print(f"Skip {eval_name}: {e}")
             continue
 
-        train_transform = extractor.get_transform(augment=args.augment)
-        test_transform = extractor.get_transform(augment=False)
+        # 【変更点】 get_transform に mode を渡す (Scratch時にRandAugmentを有効化するため)
+        train_transform = extractor.get_transform(augment=args.augment, mode=mode)
+        # Test時はAugmentationなし (mode="eval"扱いで良いが、デフォルト引数でAugment=Falseならmode関係なくOffになる)
+        test_transform = extractor.get_transform(augment=False, mode=mode)
 
         test_ds = ImageDataset(real_test_imgs, real_test_lbls, test_transform)
         test_loader = DataLoader(

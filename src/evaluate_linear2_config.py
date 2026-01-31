@@ -12,7 +12,8 @@ SEED = 42
 IMG_SIZE = 224
 
 # [SPEEDUP] High VRAM Settings
-BATCH_SIZE = 2048
+#BATCH_SIZE = 2048
+BATCH_SIZE = 1024
 NUM_WORKERS = min(32, os.cpu_count() if os.cpu_count() else 4)
 
 # ========================================================
@@ -146,11 +147,13 @@ TRAIN_CONFIGS = {
         "optimizer": "AdamW",
         "lr_backbone": 1e-3,
         "lr_head": 1e-3,
-        "weight_decay": 1e-4,
-        "epochs": 1000,
-        "patience": 50,
+        # 【変更点】 Weight Decayを強化 (1e-4 -> 1e-2) して過学習抑制
+        "weight_decay": 1e-2,
+        # 【変更点】 Epochsを短縮 (1000 -> 60) し、Patienceも短くする
+        "epochs": 60,
+        "patience": 10,
         "batch_size": 16,
         "scheduler": "cosine",
-        "val_interval": 20,
+        "val_interval": 5, # 頻繁にチェック
     },
 }

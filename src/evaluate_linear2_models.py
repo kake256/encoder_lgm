@@ -130,13 +130,41 @@ class FeatureExtractor:
         self.core.to(DEVICE)
         self.core.eval()
 
-    def get_transform(self, augment: bool = False):
+    # 【変更点】 mode引数を追加して、モードに応じたAugmentationを適用
+    def get_transform(self, augment: bool = False, mode: str = "linear_torch"):
+        # 【変更点】 Scratch, Full FT, LoRA の場合は強いAugmentation (RandAugment) を使用
+        use_strong_aug = augment and (mode in ["scratch", "full_ft", "full_ft_long", "lora"])
+        
+        if use_strong_aug:
+            print(f"   [Transform] Applying Strong RandAugment for mode: {mode}")
+        elif augment:
+            print(f"   [Transform] Applying Standard Augmentation for mode: {mode}")
+
         if self.type == "timm":
+            if use_strong_aug:
+                # timmのRandAugment (m9-mstd0.5) を適用
+                return create_transform(
+                    input_size=IMG_SIZE,
+                    is_training=True,
+                    auto_augment="rand-m9-mstd0.5-inc1",
+                    interpolation='bicubic'
+                )
+            # augment=True で LinearProbeなどの場合は通常のAugmentation
             return create_transform(**self.data_config, is_training=augment)
+
         if self.type == "swav":
             mean = (0.485, 0.456, 0.406)
             std = (0.229, 0.224, 0.225)
-            if augment:
+            if use_strong_aug:
+                # 【変更点】 手動でRandAugmentを追加
+                return T.Compose([
+                    T.RandAugment(num_ops=2, magnitude=9), # Strong
+                    T.RandomResizedCrop(224, scale=(0.8, 1.0), antialias=True),
+                    T.RandomHorizontalFlip(),
+                    T.ToTensor(),
+                    T.Normalize(mean=mean, std=std)
+                ])
+            elif augment:
                 return T.Compose([
                     T.RandomResizedCrop(224, scale=(0.8, 1.0), antialias=True),
                     T.RandomHorizontalFlip(),
@@ -150,8 +178,19 @@ class FeatureExtractor:
                     T.ToTensor(),
                     T.Normalize(mean=mean, std=std)
                 ])
+
         if self.type == "open_clip":
-            if augment:
+            if use_strong_aug:
+                mean = (0.48145466, 0.4578275, 0.40821073)
+                std = (0.26862954, 0.26130258, 0.27577711)
+                return T.Compose([
+                    T.RandAugment(num_ops=2, magnitude=9), # Strong
+                    T.RandomResizedCrop(224, scale=(0.8, 1.0), antialias=True),
+                    T.RandomHorizontalFlip(),
+                    T.ToTensor(),
+                    T.Normalize(mean=mean, std=std)
+                ])
+            elif augment:
                 mean = (0.48145466, 0.4578275, 0.40821073)
                 std = (0.26862954, 0.26130258, 0.27577711)
                 return T.Compose([
@@ -164,7 +203,15 @@ class FeatureExtractor:
                 return self.preprocess
 
         def hf_process_wrapper(img):
-            if augment:
+            if use_strong_aug:
+                # 【変更点】 HFモデル用の強い拡張
+                aug = T.Compose([
+                    T.RandAugment(num_ops=2, magnitude=9), # Strong
+                    T.RandomResizedCrop(224, scale=(0.8, 1.0), antialias=True),
+                    T.RandomHorizontalFlip()
+                ])
+                img = aug(img)
+            elif augment:
                 aug = T.Compose([
                     T.RandomResizedCrop(224, scale=(0.8, 1.0), antialias=True),
                     T.RandomHorizontalFlip()
@@ -215,6 +262,9 @@ class TrainableModel(nn.Module):
         if self.model_type == "open_clip":
             self.full_core = extractor.core
             self.visual_core = extractor.core.visual
+        
+        # 【変更点】 Dropout層を追加 (過学習防止)
+        self.dropout = nn.Dropout(p=0.5)
 
         self.head = nn.Linear(self.embed_dim, num_classes)
         self.head.weight.data.normal_(mean=0.0, std=0.01)
@@ -244,13 +294,15 @@ class TrainableModel(nn.Module):
         return f
 
     def forward_head(self, features: torch.Tensor) -> torch.Tensor:
-        return self.head(features)
+        # 【変更点】 Headの前にDropoutを通す
+        x = self.dropout(features)
+        return self.head(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = self.get_features(x)
         return self.forward_head(feats)
     
-    # 【修正】BNの挙動をScratchとFullFTで分離
+    # BNの挙動をScratchとFullFTで分離
     def set_mode(self, mode: str):
         if mode == "scratch":
             # Scratch: 統計量がないのでBNも学習する (trainモード)
