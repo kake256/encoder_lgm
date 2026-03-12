@@ -8,12 +8,20 @@ makeData_old/
 ft_results/
 hf_datasets_cache/
 mixed_ft_results/
+Food-101/
+ImageNet-100/
+imagenet100_FULL_prototype/
 
 # 結果・出力・ログ関連
 classification_results/
 evaluation_results_critique/
+evaluation_results_kd/
+evaluation_results_knn/
 results_lgm/
 visualizations/
+outputs/
+evaluation_results_fast/
+.feature_cache/
 
 # 重みファイル (モデルなど)
 weights/
