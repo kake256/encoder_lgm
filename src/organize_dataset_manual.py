@@ -12,14 +12,15 @@ CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent 
 
 # ★変更点: 親フォルダではなく、対象の日付フォルダを直接指定します
-# (自動検出による別フォルダの誤検知を防ぐため)
-#DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "classification_results" / "gene_experiment_4models_comparison" / "20260101_192533"
-DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "classification_results" / "sent" / "20260115_150140" #"20260115_061103" #"20260115_024226" #"20260112_040759"
+# (自動検出による別フォルダの誤検知を防ぐため) encoder_lgm/classification_results/gene_experiment_feature_bank_imagenet100/20260122_054736
+DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "classification_results" / "gene_experiment_imagenet100_LORA" / "20260415_203757" #"20260117_005107" #"20260116_052258"
+
+#DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "classification_results" / "sent" / "20260115_150140" #"20260115_061103" #"20260115_024226" #"20260112_040759"
 #"20260111_214343" #"20260111_183657" #"20260109_160415" #"20260108_034458" 
 
 # ★変更点: Food101用の出力先に設定
 #OUTPUT_DATASET_DIR = PROJECT_ROOT / "makeData" / "dataset_clean_food101"
-OUTPUT_DATASET_DIR = PROJECT_ROOT / "makeData" / "dataset_clean_ImageNet1k_200_typo"
+OUTPUT_DATASET_DIR = PROJECT_ROOT / "makeData" / "dataset_clean_imagenet100_FULL_LORAtest"
 
 # 収集対象のキーワード
 TARGET_KEYWORDS = ["result_gen"]
@@ -63,6 +64,7 @@ def is_target_file(filename):
 def main():
     parser = argparse.ArgumentParser(description="実験結果をクラス＞モデル順に整理します")
     parser.add_argument("--input", "-i", type=str, default=None, help="手動でパスを指定する場合")
+    parser.add_argument("--output", "-o", type=str, default=None, help="整理後データセットの出力先")
     parser.add_argument("--clean", action="store_true", help="実行前に出力先を空にする")
     args = parser.parse_args()
 
@@ -90,11 +92,13 @@ def main():
         # gen_dataフォルダがない場合（直下にモデルフォルダがある場合など）への対応
         data_root = input_path
 
+    output_dataset_dir = Path(args.output) if args.output else OUTPUT_DATASET_DIR
+
     print(f"==================================================")
     print(f" Dataset Organizer (Class > Model > Image)")
     print(f"==================================================")
     print(f" Source : {data_root}")
-    print(f" Target : {OUTPUT_DATASET_DIR}")
+    print(f" Target : {output_dataset_dir}")
     print(f"==================================================")
 
     if not data_root.exists():
@@ -102,9 +106,9 @@ def main():
         return
 
     # 3. 出力先の準備
-    if args.clean and OUTPUT_DATASET_DIR.exists():
+    if args.clean and output_dataset_dir.exists():
         print("Cleaning old dataset...")
-        shutil.rmtree(OUTPUT_DATASET_DIR)
+        shutil.rmtree(output_dataset_dir)
     
     # 4. 走査とコピー実行
     exp_dirs = [d for d in data_root.iterdir() if d.is_dir()]
@@ -135,7 +139,7 @@ def main():
             class_name = class_dir.name 
             
             # 保存先パス: Output / クラス名 / モデル名
-            dest_dir = OUTPUT_DATASET_DIR / class_name / model_name
+            dest_dir = output_dataset_dir / class_name / model_name
             dest_dir.mkdir(parents=True, exist_ok=True)
             
             # 直下のPNGのみ取得
@@ -162,7 +166,7 @@ def main():
 
     print(f"\n[Success] 完了しました。")
     print(f"合計 {total_count} 枚の画像をコピーしました。")
-    print(f"保存先: {OUTPUT_DATASET_DIR}")
+    print(f"保存先: {output_dataset_dir}")
     
     # ★追加: クラス別内訳の表示
     if class_counts:

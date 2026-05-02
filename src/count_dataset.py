@@ -9,7 +9,7 @@ CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent 
 
 # デフォルトの集計対象ディレクトリ
-DEFAULT_TARGET_DIR = PROJECT_ROOT / "makeData" / "dataset_clean_ImageNet1k_200_typo"
+DEFAULT_TARGET_DIR = PROJECT_ROOT / "makeData" / "dataset_clean_imagenet100" #"dataset_clean_ImageNet1k_200_typo"
 
 # ==============================================================================
 # 2. 集計ロジック

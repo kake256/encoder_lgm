@@ -1,5 +1,5 @@
 # ファイル名: evaluate_linear2_engine.py
-# 内容: PyTorchおよびSklearnの学習ループ, 評価関数 (BN修正版)
+# 内容: データ拡張戦略(3パターン)に対応した高速化エンジン
 
 import os
 import re
@@ -11,14 +11,12 @@ from datetime import datetime
 from sklearn.metrics import accuracy_score
 from sklearn.linear_model import LogisticRegression
 from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader, TensorDataset
 
 from evaluate_linear2_config import DEVICE
 from evaluate_linear2_models import TrainableModel, select_trainable_params
 
 def train_sklearn_lbfgs(extractor, train_loader, X_test, y_test, config):
-    """
-    Sklearnを使用したロジスティック回帰
-    """
     X_train, y_train = extractor.extract_features(train_loader)
     if X_train.size == 0:
         return 0.0, 0, 0, 0, np.array([]), np.array([])
@@ -32,29 +30,81 @@ def train_sklearn_lbfgs(extractor, train_loader, X_test, y_test, config):
         n_jobs=-1,
     )
     clf.fit(X_train, y_train)
-
     y_pred = clf.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
     train_acc = accuracy_score(y_train, clf.predict(X_train))
-
     return float(acc), float(train_acc), 0, 0, y_test, y_pred
 
-def train_pytorch_pipeline(extractor, train_loader, test_loader, num_classes, mode, config, log_dir=None, run_name=None):
-    """
-    PyTorch学習パイプライン
-    修正: ループ内で model.set_mode(mode) を使用し、BNの挙動を正しく制御するように変更
-    """
+def train_pytorch_pipeline(extractor, train_loader, test_loader, num_classes, mode, config, 
+                           log_dir=None, run_name=None, 
+                           aug_strategy="none", aug_expansion=20):
+    
+    # -------------------------------------------------------
+    # [Speedup] Feature Caching / Pre-computation Logic
+    # -------------------------------------------------------
+    cached_features = False
+    
+    if mode == "linear_torch":
+        # --- Pattern 1: None (Augなし, Cacheあり) ---
+        if aug_strategy == "none":
+            print("   [Mode] No Augmentation. Standard Caching (1x).")
+            feats, lbls = extractor.extract_features(train_loader)
+            if len(feats) > 0:
+                train_ds = TensorDataset(torch.from_numpy(feats).float(), torch.from_numpy(lbls).long())
+                cached_features = True
+        
+        # --- Pattern 2: Precompute (Augあり, Cacheあり, Nx膨張) ---
+        elif aug_strategy == "precompute":
+            print(f"   [Mode] Pre-computed Augmentation. Caching with {aug_expansion}x expansion...")
+            all_feats_list = []
+            all_lbls_list = []
+            try:
+                for i in range(aug_expansion):
+                    if i % 10 == 0: print(f"     -> Expansion step {i+1}/{aug_expansion}...")
+                    f, l = extractor.extract_features(train_loader)
+                    if len(f) > 0:
+                        all_feats_list.append(f)
+                        all_lbls_list.append(l)
+                
+                if len(all_feats_list) > 0:
+                    final_feats = np.concatenate(all_feats_list, axis=0)
+                    final_lbls = np.concatenate(all_lbls_list, axis=0)
+                    train_ds = TensorDataset(
+                        torch.from_numpy(final_feats).float(), 
+                        torch.from_numpy(final_lbls).long()
+                    )
+                    cached_features = True
+                    print(f"   [Done] Expanded Dataset: {len(train_loader.dataset)} -> {len(train_ds)} samples.")
+            except Exception as e:
+                print(f"   [Error] Pre-computation failed: {e}. Fallback to on_the_fly.")
+
+        # --- Pattern 3: On-the-fly (Augあり, Cacheなし) ---
+        elif aug_strategy == "on_the_fly":
+            print("   [Mode] On-the-fly Augmentation. No Caching (Slow but Infinite diversity).")
+            cached_features = False
+
+    # キャッシュ成功時: Loaderを差し替えてオンメモリ爆速化
+    if cached_features:
+        bs = train_loader.batch_size
+        if bs is None or bs < 256: bs = 1024
+        
+        train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=0, pin_memory=True)
+        
+        test_feats, test_lbls = extractor.extract_features(test_loader)
+        if len(test_feats) > 0:
+            test_ds = TensorDataset(torch.from_numpy(test_feats).float(), torch.from_numpy(test_lbls).long())
+            test_loader = DataLoader(test_ds, batch_size=bs, shuffle=False, num_workers=0, pin_memory=True)
+
+    # -------------------------------------------------------
+    # Model Setup
+    # -------------------------------------------------------
     model = TrainableModel(extractor, num_classes).to(DEVICE)
 
     params_to_optimize, lora_targets, did_fallback, policy_name = select_trainable_params(
         model, mode, config, train_batch_size=int(getattr(train_loader, "batch_size", 1) or 1)
     )
 
-    # ログ用にパラメータ数を計算
     t_cnt = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    if did_fallback:
-        print(f"[Warning] select_trainable_params fallback occurred. policy={policy_name}")
 
     if config["optimizer"] == "Adam":
         optimizer = torch.optim.Adam(
@@ -82,14 +132,9 @@ def train_pytorch_pipeline(extractor, train_loader, test_loader, num_classes, mo
     max_epochs = int(config["epochs"])
     val_interval = int(config.get("val_interval", 5))
 
-    # 記録用リスト
     history = []
 
     for epoch in range(max_epochs):
-        # =========================================================
-        # 【修正】ここを model.set_mode(mode) に一任する
-        # これにより、scratch時はBN学習(train)、full_ft時はBN固定(eval)が正しく適用される
-        # =========================================================
         model.set_mode(mode)
 
         running_loss = 0.0
@@ -100,12 +145,16 @@ def train_pytorch_pipeline(extractor, train_loader, test_loader, num_classes, mo
             optimizer.zero_grad(set_to_none=True)
 
             with autocast():
-                if mode == "linear_torch":
-                    with torch.no_grad():
-                        feats = model.get_features(x)
-                    out = model.forward_head(feats)
+                # [Speedup] キャッシュ済みならForwardHeadのみ
+                if cached_features:
+                    out = model.forward_head(x)
                 else:
-                    out = model(x)
+                    if mode == "linear_torch":
+                        with torch.no_grad():
+                            feats = model.get_features(x)
+                        out = model.forward_head(feats)
+                    else:
+                        out = model(x)
                 loss = criterion(out, y)
 
             scaler.scale(loss).backward()
@@ -124,9 +173,8 @@ def train_pytorch_pipeline(extractor, train_loader, test_loader, num_classes, mo
         val_loss = None
         val_acc = None
         
-        # Validation Check
         if (epoch + 1) % val_interval == 0 or epoch == max_epochs - 1:
-            val_loss, val_acc, _, _ = evaluate_metrics(model, test_loader, criterion)
+            val_loss, val_acc, _, _ = evaluate_metrics(model, test_loader, criterion, is_features=cached_features)
             
             if val_acc > best_acc:
                 best_acc = val_acc
@@ -134,61 +182,42 @@ def train_pytorch_pipeline(extractor, train_loader, test_loader, num_classes, mo
             else:
                 patience_counter += val_interval
                 if patience_counter >= patience:
-                    # Early stopping logging
                     history.append({
                         "epoch": epoch + 1,
                         "mode": mode,
-                        "policy": policy_name,
-                        "trainable_params": t_cnt,
                         "train_loss": epoch_train_loss,
                         "val_loss": val_loss,
                         "val_acc": val_acc
                     })
                     break
         
-        # 履歴追加
         history.append({
             "epoch": epoch + 1,
             "mode": mode,
-            "policy": policy_name,
-            "trainable_params": t_cnt,
             "train_loss": epoch_train_loss,
             "val_loss": val_loss, 
             "val_acc": val_acc
         })
-        
-        if (epoch + 1) % val_interval == 0:
-            # 進捗確認用 (必要に応じてコメントアウト解除)
-            pass
 
-    # CSV保存ロジック (サニタイズ + 安全策)
     if log_dir:
-        # run_name が無い場合のフォールバック
         if not run_name:
             run_name = f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            
-        # ファイル名サニタイズ: 英数字, ., -, _ 以外を _ に置換し、長さを制限
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_name)[:150]
         csv_filename = f"{safe_name}_log.csv"
         csv_path = os.path.join(log_dir, csv_filename)
-        
         try:
             df_history = pd.DataFrame(history)
             df_history.to_csv(csv_path, index=False)
         except Exception as e:
-            print(f"[Warning] Failed to save training log to {csv_path}: {e}")
+            print(f"[Warning] Failed to save training log: {e}")
 
-    # 最終評価
-    _, final_acc, y_true, y_pred = evaluate_metrics(model, test_loader, criterion)
-    _, train_acc, _, _ = evaluate_metrics(model, train_loader, criterion)
+    _, final_acc, y_true, y_pred = evaluate_metrics(model, test_loader, criterion, is_features=cached_features)
+    _, train_acc, _, _ = evaluate_metrics(model, train_loader, criterion, is_features=cached_features)
 
     tot_cnt = sum(p.numel() for p in model.parameters())
     return float(final_acc), float(train_acc), t_cnt, tot_cnt, (lora_targets or []), y_true, y_pred
 
-def evaluate_metrics(model, loader, criterion):
-    """
-    AccuracyだけでなくLossも計算して返す評価関数
-    """
+def evaluate_metrics(model, loader, criterion, is_features=False):
     model.eval()
     preds, targets = [], []
     total_loss = 0.0
@@ -197,9 +226,12 @@ def evaluate_metrics(model, loader, criterion):
     with torch.no_grad(), autocast():
         for x, y in loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
-            out = model(x)
             
-            # Loss計算
+            if is_features:
+                out = model.forward_head(x)
+            else:
+                out = model(x)
+            
             loss = criterion(out, y)
             batch_size = x.size(0)
             total_loss += loss.item() * batch_size

@@ -1,5 +1,6 @@
 # ファイル名: src/distillation/evaluate_fast_unified_es.py
-# 内容: 全学習モード・KD・自動ロジット・CSV・実行順序・高速化 ＋ 【大容量データ完全対応(真のLazy Load)版】
+# 内容: 全学習モード・KD・自動ロジット・CSV・実行順序 ＋ 【Lazy Load版】＋【I/O最適化＋自動DAオフ＋KD厳密判定＋大容量時キャッシュ再利用】
+# 変更点: --disable_cache を追加し, 特徴キャッシュの読み込み・書き込みを無効化可能にした版
 
 import os
 import sys
@@ -29,7 +30,7 @@ from transformers import AutoModel, AutoProcessor, ResNetModel, AutoConfig
 from datasets import load_dataset
 
 warnings.filterwarnings("ignore", category=FutureWarning)
-ImageFile.LOAD_TRUNCATED_IMAGES = True  
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Optional imports
 try:
@@ -54,13 +55,13 @@ except ImportError:
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 IMG_SIZE = 224
-BATCH_SIZE = 1024  
-NUM_WORKERS = 8 
+BATCH_SIZE = 1024
+NUM_WORKERS = 4
 
-KD_ALPHA = 0.5 
-KD_TEMPERATURE = 4.0 
+KD_ALPHA = 0.5
+KD_TEMPERATURE = 4.0
 
-MAX_MEMORY_SAMPLES = 5000 
+MAX_MEMORY_SAMPLES = 50000
 
 AVAILABLE_EVAL_MODELS = {
     "ResNet50": "microsoft/resnet-50",
@@ -126,9 +127,8 @@ def norm_name(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', s)
 
 def get_fewshot_subset(imgs, lbls, shots_per_class):
-    # imgs が HuggingFaceのDatasetオブジェクトの場合の対応
     is_hf_dataset = not isinstance(imgs, list)
-    
+
     subset_indices = []
     counts = {}
     for i, lbl in enumerate(lbls):
@@ -136,12 +136,12 @@ def get_fewshot_subset(imgs, lbls, shots_per_class):
         if counts[lbl] < shots_per_class:
             subset_indices.append(i)
             counts[lbl] += 1
-            
+
     if is_hf_dataset:
         subset_imgs = imgs.select(subset_indices)
     else:
         subset_imgs = [imgs[i] for i in subset_indices]
-        
+
     subset_lbls = [lbls[i] for i in subset_indices]
     return subset_imgs, subset_lbls
 
@@ -151,10 +151,14 @@ def get_teachers_from_exp_name(exp_name):
             return teachers
     teachers = []
     lower_name = exp_name.lower()
-    if "dino-v1" in lower_name or "dinov1" in lower_name or "v1" in lower_name: teachers.append("DINOv1")
-    if "dino-v2" in lower_name or "dinov2" in lower_name or "v2" in lower_name: teachers.append("DINOv2")
-    if "clip" in lower_name: teachers.append("CLIP")
-    if "siglip" in lower_name: teachers.append("SigLIP")
+    if "dino-v1" in lower_name or "dinov1" in lower_name or "v1" in lower_name:
+        teachers.append("DINOv1")
+    if "dino-v2" in lower_name or "dinov2" in lower_name or "v2" in lower_name:
+        teachers.append("DINOv2")
+    if "clip" in lower_name:
+        teachers.append("CLIP")
+    if "siglip" in lower_name:
+        teachers.append("SigLIP")
     return teachers if teachers else None
 
 def ensure_logits_extracted(exp_name, image_paths, labels):
@@ -172,12 +176,13 @@ def ensure_logits_extracted(exp_name, image_paths, labels):
     all_teachers_logits = []
 
     for t_name in teachers_to_use:
-        if t_name not in AVAILABLE_EVAL_MODELS: continue
-        
+        if t_name not in AVAILABLE_EVAL_MODELS:
+            continue
+
         ext = FeatureExtractor(AVAILABLE_EVAL_MODELS[t_name], pretrained=True)
         temp_model = TrainableModel(ext, num_classes=1000).to(DEVICE)
         temp_model.eval()
-        
+
         features = []
         with torch.no_grad(), autocast():
             for img_path in tqdm(image_paths, desc=f"Extract ({t_name})", leave=False):
@@ -185,7 +190,7 @@ def ensure_logits_extracted(exp_name, image_paths, labels):
                 tensor_img = ext.get_transform(augment=False)(img).unsqueeze(0).to(DEVICE)
                 feat = temp_model.get_features(tensor_img)
                 features.append(feat.cpu().numpy()[0])
-                
+
         del temp_model
         del ext
         torch.cuda.empty_cache()
@@ -197,13 +202,13 @@ def ensure_logits_extracted(exp_name, image_paths, labels):
         logits = np.dot(X_train, clf.coef_.T) + clf.intercept_
         all_teachers_logits.append(logits)
 
-    if not all_teachers_logits: return
+    if not all_teachers_logits:
+        return
     mean_logits = np.mean(all_teachers_logits, axis=0)
-    
+
     for i, img_path in enumerate(image_paths):
-        save_path = os.path.splitext(img_path)[0] + '.pt'
         logit_tensor = torch.tensor(mean_logits[i], dtype=torch.float32)
-        torch.save(logit_tensor, save_path)
+        torch.save(logit_tensor, os.path.splitext(img_path)[0] + '.pt')
 
 # ========================================================
 # 3. Data Loading (Fast Memory Load & Lazy Load)
@@ -214,71 +219,94 @@ class KDImageDataset(Dataset):
         self.labels = labels
         self.transform = transform
         self.is_hf = not isinstance(data_source, list)
-        
-    def __len__(self): return len(self.data_source)
+
+    def __len__(self):
+        return len(self.data_source)
+
     def __getitem__(self, idx):
         if self.is_hf:
-            # HuggingFace Datasetの場合は都度読み込む
             img = self.data_source[idx]["image"].convert("RGB")
         else:
             item = self.data_source[idx]
             img = item
             if isinstance(item, str):
-                try: img = Image.open(item).convert("RGB")
-                except: img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
-            elif isinstance(item, bytes):  
-                try: img = Image.open(io.BytesIO(item)).convert("RGB")
-                except: img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
-            
-        if self.transform: img = self.transform(img)
+                try:
+                    img = Image.open(item).convert("RGB")
+                except Exception:
+                    img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
+            elif isinstance(item, bytes):
+                try:
+                    img = Image.open(io.BytesIO(item)).convert("RGB")
+                except Exception:
+                    img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
+
+        if self.transform:
+            img = self.transform(img)
         return img, self.labels[idx]
 
 class LazyTrainDataset(Dataset):
-    def __init__(self, data_source, labels, use_kd, img_size=224):
+    def __init__(self, data_source, labels, use_kd, img_size=224, augment=False):
         self.data_source = data_source
         self.labels = labels
         self.use_kd = use_kd
-        self.transform = T.Compose([T.Resize((img_size, img_size)), T.ToTensor()])
+        self.augment = augment
+        if augment:
+            self.transform = T.Compose([
+                T.RandomResizedCrop(img_size, scale=(0.08, 1.0), antialias=True),
+                T.RandomHorizontalFlip(),
+                T.ToTensor()
+            ])
+        else:
+            self.transform = T.Compose([
+                T.Resize((img_size, img_size)),
+                T.ToTensor()
+            ])
+
         self.is_hf = not isinstance(data_source, list)
-        
-    def __len__(self): 
+
+    def __len__(self):
         return len(self.data_source)
-        
+
     def __getitem__(self, idx):
         if self.is_hf:
-            # HFのディスクキャッシュから直接読み込む(超省メモリ)
             img = self.data_source[idx]["image"].convert("RGB")
-            item = None # HFデータは文字列パスを持たないのでKDは不可とする
+            item = None
         else:
             item = self.data_source[idx]
             if isinstance(item, str):
-                try: img = Image.open(item).convert("RGB")
-                except: img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
-            elif isinstance(item, bytes): 
-                try: img = Image.open(io.BytesIO(item)).convert("RGB")
-                except: img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
+                try:
+                    img = Image.open(item).convert("RGB")
+                except Exception:
+                    img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
+            elif isinstance(item, bytes):
+                try:
+                    img = Image.open(io.BytesIO(item)).convert("RGB")
+                except Exception:
+                    img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
             else:
-                img = item 
-            
+                img = item
+
         tensor_img = self.transform(img)
         label = self.labels[idx]
-        
+
         logit = torch.zeros(1)
         if self.use_kd and isinstance(item, str):
             pt_path = os.path.splitext(item)[0] + '.pt'
             if os.path.exists(pt_path):
                 try:
                     loaded = torch.load(pt_path, map_location='cpu')
-                    if loaded.dim() == 2: loaded = loaded.squeeze(0)
+                    if loaded.dim() == 2:
+                        loaded = loaded.squeeze(0)
                     logit = loaded
-                except: pass
-                
+                except Exception:
+                    pass
+
         return tensor_img, label, logit
 
 def load_syn_data_to_memory(image_paths, labels, load_logits=False, img_size=224):
     transform = T.Compose([T.Resize((img_size, img_size)), T.ToTensor()])
     all_images, all_logits = [], []
-    
+
     for img_path in tqdm(image_paths, desc="Loading Syn Data (Memory)", leave=False):
         try:
             img = Image.open(img_path).convert("RGB")
@@ -286,43 +314,43 @@ def load_syn_data_to_memory(image_paths, labels, load_logits=False, img_size=224
         except Exception:
             tensor_img = torch.zeros(3, img_size, img_size)
         all_images.append(tensor_img)
-        
+
         if load_logits:
             pt_path = os.path.splitext(img_path)[0] + '.pt'
             if os.path.exists(pt_path):
                 try:
                     logit = torch.load(pt_path, map_location='cpu')
-                    if logit.dim() == 2: logit = logit.squeeze(0)
+                    if logit.dim() == 2:
+                        logit = logit.squeeze(0)
                     all_logits.append(logit)
-                except:
+                except Exception:
                     all_logits.append(None)
             else:
                 all_logits.append(None)
 
     images_tensor = torch.stack(all_images)
     labels_tensor = torch.tensor(labels, dtype=torch.long)
-    
+
     logits_tensor = None
     if load_logits and any(l is not None for l in all_logits):
         valid_l = next(l for l in all_logits if l is not None)
         dim = valid_l.shape[0]
         logits_tensor = torch.stack([l if l is not None else torch.zeros(dim) for l in all_logits])
-        
+
     return images_tensor, labels_tensor, logits_tensor
 
 def convert_pil_to_tensor_memory(images, labels, img_size=224):
-    # これは実画像が少ない時だけ呼ばれる
     transform = T.Compose([T.Resize((img_size, img_size)), T.ToTensor()])
     tensor_list = []
-    
+
     is_hf = not isinstance(images, list)
     iterable = range(len(images)) if is_hf else images
-    
+
     for item in tqdm(iterable, desc="Processing Real Data (Memory)", leave=False):
         try:
             if is_hf:
                 img = images[item]["image"].convert("RGB")
-            elif isinstance(item, bytes): 
+            elif isinstance(item, bytes):
                 img = Image.open(io.BytesIO(item)).convert("RGB")
             else:
                 img = item
@@ -336,11 +364,13 @@ def convert_pil_to_tensor_memory(images, labels, img_size=224):
 
 # --- HuggingFace Helper Functions ---
 def fetch_imagenet_wnid_map():
-    if requests is None: return {}
+    if requests is None:
+        return {}
     try:
         resp = requests.get("https://s3.amazonaws.com/deep-learning-models/image-models/imagenet_class_index.json", timeout=5)
         return {wnid: int(idx_str) for idx_str, (wnid, _) in resp.json().items()}
-    except Exception: return {}
+    except Exception:
+        return {}
 
 def _infer_label_id_map_from_hf(ds, synthetic_class_map):
     label_col = "label"
@@ -349,7 +379,7 @@ def _infer_label_id_map_from_hf(ds, synthetic_class_map):
             if c in ds.features:
                 label_col = c
                 break
-    
+
     hf_names = list(ds.features[label_col].names) if hasattr(ds.features[label_col], "names") else None
     syn_samples = list(synthetic_class_map.keys())[:3]
     hf_norm_to_id = {}
@@ -366,20 +396,23 @@ def _infer_label_id_map_from_hf(ds, synthetic_class_map):
         hf_id = None
         name_part = syn_class_name
         m_prefix = re.match(r"^(\d+)[._](.+)$", syn_class_name)
-        
+
         if m_prefix:
             name_part = m_prefix.group(2)
             ext_id = int(m_prefix.group(1))
             if hf_names and len(hf_names) >= 1000 and 0 <= ext_id < len(hf_names):
                 hf_id = ext_id
 
-        if hf_id is None and wnid_map and syn_class_name in wnid_map: hf_id = wnid_map[syn_class_name]
+        if hf_id is None and wnid_map and syn_class_name in wnid_map:
+            hf_id = wnid_map[syn_class_name]
         if hf_id is None:
             key = norm_name(name_part)
-            if key in hf_norm_to_id: hf_id = hf_norm_to_id[key]
+            if key in hf_norm_to_id:
+                hf_id = hf_norm_to_id[key]
             if hf_id is None and "__" in name_part:
                 k2 = norm_name(name_part.split("__")[0])
-                if k2 in hf_norm_to_id: hf_id = hf_norm_to_id[k2]
+                if k2 in hf_norm_to_id:
+                    hf_id = hf_norm_to_id[k2]
             if hf_id is None and norm_name(syn_class_name) in hf_norm_to_id:
                 hf_id = hf_norm_to_id[norm_name(syn_class_name)]
         if hf_id is not None:
@@ -389,7 +422,7 @@ def _infer_label_id_map_from_hf(ds, synthetic_class_map):
     for syn_class_name, internal_idx in synthetic_class_map.items():
         if internal_idx not in syn_internal_to_hf_label:
             missing_classes.append(syn_class_name)
-    
+
     if missing_classes:
         print(f"\n[Warning] HFラベルとの紐付けに失敗したクラスが {len(missing_classes)} 個あります:")
         print(missing_classes)
@@ -397,18 +430,19 @@ def _infer_label_id_map_from_hf(ds, synthetic_class_map):
 
     return syn_internal_to_hf_label, label_col
 
-    
+
 def load_real_data_hf_generic(hf_dataset, split, synthetic_class_map, max_per_class, seed=42):
-    # ここが超重要: keep_in_memory=Trueを外し、HuggingFaceの遅延読み込みを有効にする
-    try: ds = load_dataset(hf_dataset, split=split)
-    except Exception: ds = load_dataset(hf_dataset, split=split, trust_remote_code=True)
+    try:
+        ds = load_dataset(hf_dataset, split=split)
+    except Exception:
+        ds = load_dataset(hf_dataset, split=split, trust_remote_code=True)
 
     internal_to_hf, label_col = _infer_label_id_map_from_hf(ds, synthetic_class_map)
     hf_to_internal = {v: k for k, v in internal_to_hf.items()}
-    
+
     all_labels = np.array(ds[label_col])
     selected_indices = []
-    
+
     if max_per_class <= 0:
         valid_hf_ids = set(internal_to_hf.values())
         mask = np.isin(all_labels, list(valid_hf_ids))
@@ -427,12 +461,12 @@ def load_real_data_hf_generic(hf_dataset, split, synthetic_class_map, max_per_cl
                     selected_indices.append(int(idx))
                     counts[internal] += 1
                     collected += 1
-                    if collected >= needed: break
+                    if collected >= needed:
+                        break
 
-    # サブセットのDatasetオブジェクトをそのまま返す（メモリ消費ほぼゼロ）
     subset = ds.select(selected_indices)
     labels = [hf_to_internal[all_labels[i]] for i in selected_indices]
-    
+
     print(f"[*] Prepared real subset: {len(subset)} images (Lazy Loading Enabled)")
     return subset, labels, len(internal_to_hf)
 
@@ -445,9 +479,10 @@ class FeatureExtractor:
         self.type = "base"
         self.processor, self.core, self.preprocess = None, None, None
         self.embed_dim = 512
-        
+
         if model_identifier.startswith("timm:"):
-            if timm is None: raise ImportError("Please install timm")
+            if timm is None:
+                raise ImportError("Please install timm")
             model_name = model_identifier.split(":", 1)[1]
             self.core = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
             self.type = "timm"
@@ -459,7 +494,8 @@ class FeatureExtractor:
             return
 
         if model_identifier.startswith("openclip:"):
-            if open_clip is None: raise ImportError("Please install open_clip_torch")
+            if open_clip is None:
+                raise ImportError("Please install open_clip_torch")
             parts = model_identifier.split(":")
             pt_tag = parts[2] if (len(parts) > 2 and pretrained) else None
             self.core, _, self.preprocess = open_clip.create_model_and_transforms(parts[1], pretrained=pt_tag)
@@ -471,26 +507,33 @@ class FeatureExtractor:
 
         self.type = "hf_model"
         self.processor = AutoProcessor.from_pretrained(model_identifier)
-        if pretrained: self.core = AutoModel.from_pretrained(model_identifier)
+        if pretrained:
+            self.core = AutoModel.from_pretrained(model_identifier)
         else:
             config = AutoConfig.from_pretrained(model_identifier)
             self.core = AutoModel.from_config(config)
-            
+
         cfg = self.core.config
-        if hasattr(cfg, "projection_dim"): self.embed_dim = cfg.projection_dim
-        elif hasattr(cfg, "hidden_sizes"): self.embed_dim = cfg.hidden_sizes[-1]
-        elif hasattr(cfg, "hidden_size"): self.embed_dim = cfg.hidden_size
-        elif hasattr(cfg, "vision_config") and hasattr(cfg.vision_config, "hidden_size"): self.embed_dim = cfg.vision_config.hidden_size
-        else: self.embed_dim = 768
-            
+        if hasattr(cfg, "projection_dim"):
+            self.embed_dim = cfg.projection_dim
+        elif hasattr(cfg, "hidden_sizes"):
+            self.embed_dim = cfg.hidden_sizes[-1]
+        elif hasattr(cfg, "hidden_size"):
+            self.embed_dim = cfg.hidden_size
+        elif hasattr(cfg, "vision_config") and hasattr(cfg.vision_config, "hidden_size"):
+            self.embed_dim = cfg.vision_config.hidden_size
+        else:
+            self.embed_dim = 768
+
         self.core.to(DEVICE)
         self.core.eval()
 
     def get_transform(self, augment: bool = False):
         if self.type == "timm":
-            data_config = resolve_data_config({}, model=self.core)
-            return create_transform(**data_config, is_training=False)
-        if self.type == "open_clip": return self.preprocess
+            from timm.data import resolve_data_config, create_transform
+            return create_transform(**resolve_data_config({}, model=self.core), is_training=False)
+        if self.type == "open_clip":
+            return self.preprocess
         def hf_process_wrapper(img):
             return self.processor(images=img, return_tensors="pt")["pixel_values"].squeeze(0)
         return hf_process_wrapper
@@ -507,17 +550,25 @@ class TrainableModel(nn.Module):
         self.head.bias.data.zero_()
 
     def get_features(self, x: torch.Tensor) -> torch.Tensor:
-        if self.model_type == "timm": f = self.core(x)
-        elif self.model_type == "open_clip": f = self.core.encode_image(x)
+        if self.model_type == "timm":
+            f = self.core(x)
+        elif self.model_type == "open_clip":
+            f = self.core.encode_image(x)
         else:
-            if hasattr(self.core, "get_image_features"): f = self.core.get_image_features(pixel_values=x)
+            if hasattr(self.core, "get_image_features"):
+                f = self.core.get_image_features(pixel_values=x)
             else:
                 out = self.core(pixel_values=x)
-                if hasattr(out, "image_embeds") and out.image_embeds is not None: f = out.image_embeds
-                elif hasattr(out, "pooler_output") and out.pooler_output is not None: f = out.pooler_output
-                elif hasattr(out, "last_hidden_state"): f = out.last_hidden_state[:, 0]
-                else: f = out[0]
-        if len(f.shape) > 2: f = f.flatten(1)
+                if hasattr(out, "image_embeds") and out.image_embeds is not None:
+                    f = out.image_embeds
+                elif hasattr(out, "pooler_output") and out.pooler_output is not None:
+                    f = out.pooler_output
+                elif hasattr(out, "last_hidden_state"):
+                    f = out.last_hidden_state[:, 0]
+                else:
+                    f = out[0]
+        if len(f.shape) > 2:
+            f = f.flatten(1)
         f = f / (f.norm(dim=-1, keepdim=True) + 1e-6)
         return f
 
@@ -527,18 +578,26 @@ class TrainableModel(nn.Module):
         return logits
 
     def set_mode(self, mode: str):
-        if mode == "scratch": self.train()
+        if mode == "scratch":
+            self.train()
         elif mode == "full_ft":
             self.train()
             for m in self.modules():
-                if isinstance(m, torch.nn.modules.batchnorm._BatchNorm): m.eval()
+                if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                    m.eval()
         else:
             self.eval()
             self.head.train()
 
 # ========================================================
-# 5. Fast Training Engine 
+# 5. Fast Training Engine
 # ========================================================
+NORM_MEAN = torch.tensor([0.485, 0.456, 0.406], device=DEVICE).view(1, 3, 1, 1)
+NORM_STD  = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(1, 3, 1, 1)
+
+def normalize_only(x: torch.Tensor) -> torch.Tensor:
+    return (x - NORM_MEAN) / NORM_STD
+
 gpu_augmentor = nn.Sequential(
     T.RandomResizedCrop(224, scale=(0.08, 1.0), antialias=True),
     T.RandomHorizontalFlip(),
@@ -551,16 +610,30 @@ def manual_kd_loss(student_logits, teacher_logits, temperature):
     loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
     return loss * (temperature ** 2)
 
-def train_fast_unified(model, train_data, test_loader, mode, config, use_kd=False, cached_test_data=None, is_precomputed=False):
+def train_fast_unified(
+    model,
+    train_data,
+    test_loader,
+    mode,
+    config,
+    use_kd=False,
+    cached_test_data=None,
+    is_precomputed=False,
+    disable_da=False
+):
     is_loader = isinstance(train_data, DataLoader)
-    
+
     if is_precomputed:
         feats, labels, soft_targets = train_data
-        feats = feats.to(DEVICE)
-        labels = labels.to(DEVICE)
+        feats = feats.to(DEVICE, non_blocking=True)
+        labels = labels.to(DEVICE, non_blocking=True)
+
         do_kd = False
         if use_kd and soft_targets is not None:
-            if soft_targets.abs().sum() > 0: do_kd = True
+            if soft_targets.abs().sum() > 0:
+                soft_targets = soft_targets.to(DEVICE, non_blocking=True)
+                do_kd = True
+
         num_samples = len(feats)
         batch_size = min(num_samples, int(config.get("batch_size", 128)))
         num_batches = (num_samples + batch_size - 1) // batch_size
@@ -568,11 +641,13 @@ def train_fast_unified(model, train_data, test_loader, mode, config, use_kd=Fals
         images, labels, soft_targets = train_data
         images = images.pin_memory()
         labels = labels.pin_memory()
+
         do_kd = False
         if use_kd and soft_targets is not None:
-            if soft_targets.abs().sum() > 0: 
+            if soft_targets.abs().sum() > 0:
                 soft_targets = soft_targets.pin_memory()
                 do_kd = True
+
         num_samples = len(images)
         batch_size = min(num_samples, int(config.get("batch_size", 128)))
         num_batches = (num_samples + batch_size - 1) // batch_size
@@ -582,17 +657,22 @@ def train_fast_unified(model, train_data, test_loader, mode, config, use_kd=Fals
         num_samples = len(train_loader.dataset)
         batch_size = train_loader.batch_size
         num_batches = len(train_loader)
-    
-    params = []
-    if mode == "linear": params = [{"params": model.head.parameters()}]
-    else: params = [{"params": model.core.parameters(), "lr": float(config.get("lr_backbone", 1e-4))},
-                    {"params": model.head.parameters(), "lr": float(config.get("lr_head", 1e-3))}]
-    
+
+    if mode == "linear":
+        params = [{"params": model.head.parameters()}]
+    else:
+        params = [
+            {"params": model.core.parameters(), "lr": float(config.get("lr_backbone", 1e-4))},
+            {"params": model.head.parameters(), "lr": float(config.get("lr_head", 1e-3))}
+        ]
+
     opt_name = config.get("optimizer", "Adam")
     lr, wd = float(config.get("lr", 1e-3)), float(config.get("weight_decay", 0.0))
-    if opt_name == "AdamW": optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
-    else: optimizer = torch.optim.Adam(params, lr=lr, weight_decay=wd)
-    
+    if opt_name == "AdamW":
+        optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+    else:
+        optimizer = torch.optim.Adam(params, lr=lr, weight_decay=wd)
+
     epochs = int(config.get("epochs", 1000))
     val_interval = int(config.get("val_interval", 20))
     patience = int(config.get("patience", 5))
@@ -600,67 +680,82 @@ def train_fast_unified(model, train_data, test_loader, mode, config, use_kd=Fals
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     scaler = GradScaler()
     criterion_ce = nn.CrossEntropyLoss()
-    
+
     best_acc = 0.0
     patience_counter = 0
 
     model.set_mode(mode)
-    
+
     for epoch in range(epochs):
-        if not is_loader: indices = torch.randperm(num_samples)
+        if not is_loader:
+            indices = torch.randperm(num_samples, device=DEVICE if is_precomputed else "cpu")
         batch_iter = train_loader if is_loader else range(num_batches)
-        
+
         for step_data in batch_iter:
             if is_loader:
                 x_batch, y_batch, t_logits = step_data
                 x_batch = x_batch.to(DEVICE, non_blocking=True)
                 y_batch = y_batch.to(DEVICE, non_blocking=True)
-                if do_kd: t_logits = t_logits.to(DEVICE, non_blocking=True)
+                if do_kd:
+                    t_logits = t_logits.to(DEVICE, non_blocking=True)
             else:
                 i = step_data
-                batch_idx = indices[i*batch_size : min((i+1)*batch_size, num_samples)]
-                if is_precomputed: x_batch = feats[batch_idx].to(DEVICE, non_blocking=True)
-                else: x_batch = images[batch_idx].to(DEVICE, non_blocking=True)
-                y_batch = labels[batch_idx].to(DEVICE, non_blocking=True)
-                if do_kd: t_logits = soft_targets[batch_idx].to(DEVICE, non_blocking=True)
-            
-            optimizer.zero_grad(set_to_none=True)
-            
-            with autocast():
-                if is_precomputed: student_logits = model.head(model.dropout(x_batch))
+                batch_idx = indices[i * batch_size : min((i + 1) * batch_size, num_samples)]
+                if is_precomputed:
+                    x_batch = feats[batch_idx]
+                    y_batch = labels[batch_idx]
+                    if do_kd:
+                        t_logits = soft_targets[batch_idx]
                 else:
-                    with torch.no_grad(): x_batch = gpu_augmentor(x_batch)
+                    x_batch = images[batch_idx].to(DEVICE, non_blocking=True)
+                    y_batch = labels[batch_idx].to(DEVICE, non_blocking=True)
+                    if do_kd:
+                        t_logits = soft_targets[batch_idx].to(DEVICE, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with autocast():
+                if is_precomputed:
+                    student_logits = model.head(model.dropout(x_batch))
+                else:
+                    with torch.no_grad():
+                        if disable_da:
+                            x_batch = normalize_only(x_batch)
+                        else:
+                            x_batch = gpu_augmentor(x_batch)
                     student_logits = model(x_batch)
 
                 loss_ce = criterion_ce(student_logits, y_batch)
                 loss = loss_ce
-                
+
                 if do_kd:
                     stu_dim = student_logits.shape[1]
                     tea_dim = t_logits.shape[1]
                     if stu_dim != tea_dim:
-                        if tea_dim > stu_dim: t_logits_aligned = t_logits[:, :stu_dim]
+                        if tea_dim > stu_dim:
+                            t_logits_aligned = t_logits[:, :stu_dim]
                         else:
                             pad = torch.zeros((t_logits.shape[0], stu_dim - tea_dim), device=DEVICE)
                             t_logits_aligned = torch.cat([t_logits, pad], dim=1)
-                    else: t_logits_aligned = t_logits
+                    else:
+                        t_logits_aligned = t_logits
 
                     loss_kd = manual_kd_loss(student_logits, t_logits_aligned, KD_TEMPERATURE)
                     loss = (1.0 - KD_ALPHA) * loss_ce + KD_ALPHA * loss_kd
-            
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            
+
         scheduler.step()
-        
+
         if (epoch + 1) % val_interval == 0 or (epoch + 1) == epochs:
             model.eval()
             all_preds, all_lbls = [], []
             with torch.no_grad(), autocast():
                 if cached_test_data is not None:
                     test_feats, test_lbls = cached_test_data
-                    test_logits = model.head(test_feats.to(DEVICE))
+                    test_logits = model.head(test_feats)
                     preds = test_logits.argmax(dim=1)
                     all_preds.append(preds.cpu())
                     all_lbls.append(test_lbls.cpu())
@@ -671,13 +766,13 @@ def train_fast_unified(model, train_data, test_loader, mode, config, use_kd=Fals
                         preds = model(tx).argmax(dim=1)
                         all_preds.append(preds.cpu())
                         all_lbls.append(ty.cpu())
-            
+
             all_preds = torch.cat(all_preds)
             all_lbls = torch.cat(all_lbls)
             acc = (all_preds == all_lbls).float().mean().item()
-            
+
             model.set_mode(mode)
-            
+
             if acc >= best_acc:
                 best_acc = acc
                 patience_counter = 0
@@ -698,16 +793,16 @@ def train_fast_unified(model, train_data, test_loader, mode, config, use_kd=Fals
 
     model.eval()
     with torch.no_grad(), autocast():
-        mean = torch.tensor([0.485, 0.456, 0.406], device=DEVICE).view(1,3,1,1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(1,3,1,1)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=DEVICE).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(1, 3, 1, 1)
         correct, total = 0, 0
-        
+
         if is_precomputed:
             for i in range(num_batches):
                 s = i * batch_size
                 e = min(s + batch_size, num_samples)
-                x_b = feats[s:e].to(DEVICE, non_blocking=True)
-                y_b = labels[s:e].to(DEVICE, non_blocking=True)
+                x_b = feats[s:e]
+                y_b = labels[s:e]
                 preds = model.head(x_b).argmax(dim=1)
                 correct += (preds == y_b).sum().item()
                 total += y_b.size(0)
@@ -729,7 +824,7 @@ def train_fast_unified(model, train_data, test_loader, mode, config, use_kd=Fals
                 preds = model(x_b).argmax(dim=1)
                 correct += (preds == y_b).sum().item()
                 total += y_b.size(0)
-            
+
         train_acc = correct / total
 
     return float(best_acc), float(train_acc), class_wise_acc
@@ -739,15 +834,24 @@ def train_fast_unified(model, train_data, test_loader, mode, config, use_kd=Fals
 # ========================================================
 def get_sort_weight(exp_name):
     name = exp_name.lower()
-    if "real" in name or "baseline" in name or "prototype" in name: return 10
-    if "only_v1" in name or "dino-v1" in name: return 20
-    if "only_v2" in name or "dino-v2" in name: return 30
-    if "only_clip" in name or "clip" in name and "hybrid" not in name: return 40
-    if "only_siglip" in name or "siglip" in name and "hybrid" not in name: return 50
-    if "hybrid_v1_clip" in name: return 60
-    if "hybrid_v1_siglip" in name: return 70
-    if "hybrid_v2_clip" in name: return 80
-    if "hybrid_v2_siglip" in name: return 90
+    if "real" in name or "baseline" in name or "prototype" in name:
+        return 10
+    if "only_v1" in name or "dino-v1" in name:
+        return 20
+    if "only_v2" in name or "dino-v2" in name:
+        return 30
+    if "only_clip" in name or ("clip" in name and "hybrid" not in name):
+        return 40
+    if "only_siglip" in name or ("siglip" in name and "hybrid" not in name):
+        return 50
+    if "hybrid_v1_clip" in name:
+        return 60
+    if "hybrid_v1_siglip" in name:
+        return 70
+    if "hybrid_v2_clip" in name:
+        return 80
+    if "hybrid_v2_siglip" in name:
+        return 90
     return 100
 
 def main():
@@ -758,7 +862,8 @@ def main():
     parser.add_argument("--kd_mode", type=str, default="none", choices=["logits", "none"])
     parser.add_argument("--num_trials", type=int, default=1)
     parser.add_argument("--num_aug_caches", type=int, default=5)
-    
+    parser.add_argument("--disable_cache", action="store_true", help="Disable feature cache loading and saving.")
+
     parser.add_argument("--dataset_type", type=str, default="imagenet", choices=["imagenet", "cub", "food101", "imagenet100"])
     parser.add_argument("--max_real_test", type=int, default=50)
     parser.add_argument("--syn_counts", type=int, nargs="+", default=[])
@@ -782,31 +887,38 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(SEED)
-    
+
     csv_path = os.path.join(args.output_dir, f"results_{args.mode}_{args.kd_mode}.csv")
     class_csv_path = os.path.join(args.output_dir, f"class_results_{args.mode}_{args.kd_mode}.csv")
-    
+
     def save_result_realtime(result_dict):
         df_new = pd.DataFrame([result_dict])
-        if not os.path.exists(csv_path): df_new.to_csv(csv_path, index=False)
-        else: df_new.to_csv(csv_path, mode='a', header=False, index=False)
+        if not os.path.exists(csv_path):
+            df_new.to_csv(csv_path, index=False)
+        else:
+            df_new.to_csv(csv_path, mode='a', header=False, index=False)
 
     def save_class_result_realtime(class_dict):
         df_new = pd.DataFrame([class_dict])
-        if not os.path.exists(class_csv_path): df_new.to_csv(class_csv_path, index=False)
-        else: df_new.to_csv(class_csv_path, mode='a', header=False, index=False)
+        if not os.path.exists(class_csv_path):
+            df_new.to_csv(class_csv_path, index=False)
+        else:
+            df_new.to_csv(class_csv_path, mode='a', header=False, index=False)
 
     train_config = TRAIN_CONFIGS[args.mode].copy()
-    if args.patience is not None: train_config["patience"] = args.patience
-    if args.val_interval is not None: train_config["val_interval"] = args.val_interval
-    if args.epochs is not None: train_config["epochs"] = args.epochs
+    if args.patience is not None:
+        train_config["patience"] = args.patience
+    if args.val_interval is not None:
+        train_config["val_interval"] = args.val_interval
+    if args.epochs is not None:
+        train_config["epochs"] = args.epochs
 
     use_kd = (args.kd_mode == "logits")
 
     root = Path(args.dataset_dir)
     class_dirs = sorted([d for d in root.iterdir() if d.is_dir()])
     class_map = {d.name: i for i, d in enumerate(class_dirs)}
-    inv_class_map = {i: name for name, i in class_map.items()} 
+    inv_class_map = {i: name for name, i in class_map.items()}
     num_classes = len(class_map)
 
     experiments = {}
@@ -822,13 +934,17 @@ def main():
 
     if use_kd:
         for exp_name, data in experiments.items():
-            if data["paths"]: ensure_logits_extracted(exp_name, data["paths"], data["labels"])
+            if data["paths"]:
+                ensure_logits_extracted(exp_name, data["paths"], data["labels"])
 
     mix_strategies = {}
     if args.mix_json and os.path.exists(args.mix_json):
-        try: mix_strategies = json.load(open(args.mix_json))
-        except: pass
-    if args.mix_sources: mix_strategies["Hybrid_Custom"] = args.mix_sources
+        try:
+            mix_strategies = json.load(open(args.mix_json))
+        except Exception:
+            pass
+    if args.mix_sources:
+        mix_strategies["Hybrid_Custom"] = args.mix_sources
     for mix_name, sources in list(mix_strategies.items()):
         mix_strategies[mix_name] = [s for s in sources if s in experiments]
 
@@ -843,19 +959,25 @@ def main():
         hf_name, te_split, tr_split = args.cub_hf_dataset, args.cub_hf_test_split, "train"
 
     real_test_imgs, real_test_lbls, _ = load_real_data_hf_generic(hf_name, te_split, class_map, args.max_real_test, seed=SEED)
-    if not real_test_imgs: return
+    if not real_test_imgs:
+        return
 
     real_train_imgs, real_train_lbls = [], []
     if target_real_baseline_counts:
         max_train_needed = max(target_real_baseline_counts)
         real_train_imgs, real_train_lbls, _ = load_real_data_hf_generic(hf_name, tr_split, class_map, max_train_needed, seed=SEED)
 
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-    cache_dir = PROJECT_ROOT / ".feature_cache"
-    cache_dir.mkdir(exist_ok=True, parents=True)
+    cache_dir = None
+    if not args.disable_cache:
+        PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+        cache_dir = PROJECT_ROOT / ".feature_cache"
+        cache_dir.mkdir(exist_ok=True, parents=True)
+    else:
+        print("[*] Feature cache is disabled. Cache files will neither be read nor written.")
 
     for eval_name in args.evaluators:
-        if eval_name not in AVAILABLE_EVAL_MODELS: continue
+        if eval_name not in AVAILABLE_EVAL_MODELS:
+            continue
         print(f"\n========== Evaluator: {eval_name} ==========")
         extractor = FeatureExtractor(AVAILABLE_EVAL_MODELS[eval_name], pretrained=(args.mode != "scratch"))
         test_ds = KDImageDataset(real_test_imgs, real_test_lbls, extractor.get_transform(augment=False))
@@ -863,16 +985,19 @@ def main():
 
         cached_test_data = None
         safe_eval_name = eval_name.replace("/", "_").replace(":", "_")
-        
+
         if args.mode == "linear":
-            cache_file = cache_dir / f"linear_probe_test_feats_{args.dataset_type}_{safe_eval_name}_max{args.max_real_test}.pt"
-            
-            if cache_file.exists():
+            cache_file = None if args.disable_cache else cache_dir / f"linear_probe_test_feats_{args.dataset_type}_{safe_eval_name}_max{args.max_real_test}.pt"
+
+            if (not args.disable_cache) and cache_file.exists():
                 print(f"  [Cache] Loading pre-computed test features from {cache_file}...")
                 cached_feats, cached_lbls = torch.load(cache_file, map_location=DEVICE)
-                cached_test_data = (cached_feats, cached_lbls)
+                cached_test_data = (cached_feats.to(DEVICE), cached_lbls.to(DEVICE))
             else:
-                print(f"  [Cache] Extracting test features for {eval_name} (First time only)...")
+                if args.disable_cache:
+                    print(f"  [Cache Disabled] Extracting test features for {eval_name} without cache...")
+                else:
+                    print(f"  [Cache] Extracting test features for {eval_name} (First time only)...")
                 temp_model = TrainableModel(extractor, num_classes).to(DEVICE)
                 temp_model.eval()
                 f_list, l_list = [], []
@@ -880,154 +1005,241 @@ def main():
                     for tx, ty in tqdm(test_loader, desc="Caching Test Feats", leave=False):
                         f_list.append(temp_model.get_features(tx.to(DEVICE)).cpu())
                         l_list.append(ty.cpu())
-                
+
                 cached_feats = torch.cat(f_list)
                 cached_lbls = torch.cat(l_list)
-                torch.save((cached_feats, cached_lbls), cache_file)
+                if not args.disable_cache:
+                    torch.save((cached_feats, cached_lbls), cache_file)
                 cached_test_data = (cached_feats.to(DEVICE), cached_lbls.to(DEVICE))
+                del temp_model
+                torch.cuda.empty_cache()
 
         def run_exp(name, imgs, lbls, is_real=False):
-            if not imgs: return
+            if not imgs:
+                return
             trial_accs, trial_t_accs = [], []
-            sum_class_accs = {} 
-            class_counts = {}   
+            sum_class_accs = {}
+            class_counts = {}
+
             current_use_kd = use_kd if not is_real else False
-            
+            is_large_dataset = len(imgs) > MAX_MEMORY_SAMPLES
+            disable_da = is_large_dataset
+            current_aug_count = 1 if disable_da else args.num_aug_caches
+
             for t in range(args.num_trials):
                 set_seed(SEED + t)
                 is_precomputed = False
                 train_data = None
-                
+
                 if args.mode == "linear":
                     is_precomputed = True
                     safe_name = name.replace("/", "_").replace(":", "_")
                     kd_suffix = "_KD" if current_use_kd else ""
-                    train_cache_file = cache_dir / f"train_feats_{args.dataset_type}_{safe_eval_name}_{safe_name}_{len(imgs)}samples_{args.num_aug_caches}aug{kd_suffix}_trial{t}.pt"
-                    
-                    if train_cache_file.exists():
+
+                    target_trial_id = 0 if disable_da else t
+                    train_cache_file = None if args.disable_cache else cache_dir / f"train_feats_{args.dataset_type}_{safe_eval_name}_{safe_name}_{len(imgs)}samples_{current_aug_count}aug{kd_suffix}_trial{target_trial_id}.pt"
+
+                    if (not args.disable_cache) and train_cache_file.exists():
                         print(f"  [Cache] Loading pre-computed train features from {train_cache_file} (Trial {t+1})...")
                         cached_data = torch.load(train_cache_file, map_location='cpu')
                         if isinstance(cached_data, dict) and cached_data.get('is_memmap'):
-                            mmap_feats = np.memmap(cached_data['feats_path'], dtype='float32', mode='r', shape=cached_data['shape'])
-                            mmap_lbls = np.memmap(cached_data['lbls_path'], dtype='int64', mode='r', shape=(cached_data['shape'][0],))
+                            mmap_feats = np.memmap(cached_data['feats_path'], dtype='float32', mode='c', shape=cached_data['shape'])
+                            mmap_lbls = np.memmap(cached_data['lbls_path'], dtype='int64', mode='c', shape=(cached_data['shape'][0],))
                             cached_train_feats = torch.from_numpy(mmap_feats)
                             cached_train_lbls = torch.from_numpy(mmap_lbls)
                             if cached_data.get('logits_path'):
-                                mmap_logits = np.memmap(cached_data['logits_path'], dtype='float32', mode='r', shape=cached_data['logit_shape'])
+                                mmap_logits = np.memmap(cached_data['logits_path'], dtype='float32', mode='c', shape=cached_data['logit_shape'])
                                 cached_train_logits = torch.from_numpy(mmap_logits)
-                            else: cached_train_logits = None
+                            else:
+                                cached_train_logits = None
                         else:
                             cached_train_feats, cached_train_lbls, cached_train_logits = cached_data
                         train_data = (cached_train_feats, cached_train_lbls, cached_train_logits)
                     else:
-                        print(f"  [Cache] Extracting train features for {name} ({args.num_aug_caches} augmentations) - Trial {t+1}...")
-                        is_large_dataset = len(imgs) > MAX_MEMORY_SAMPLES
+                        if args.disable_cache:
+                            print(f"  [Cache Disabled] Extracting train features for {name} ({current_aug_count} augmentations) - Trial {t+1}...")
+                        else:
+                            print(f"  [Cache] Extracting train features for {name} ({current_aug_count} augmentations) - Trial {t+1}...")
                         temp_model = TrainableModel(extractor, num_classes).to(DEVICE)
                         temp_model.eval()
-                        total_samples = len(imgs) * args.num_aug_caches
+                        total_samples = len(imgs) * current_aug_count
                         feature_dim = temp_model.embed_dim
-                        
+
                         if is_large_dataset:
-                            print("  [Info] Using Disk-based Storage (memmap) to completely prevent RAM OOM.")
-                            feats_path = str(train_cache_file).replace(".pt", "_feats.mmap")
-                            lbls_path = str(train_cache_file).replace(".pt", "_lbls.mmap")
-                            logits_path = str(train_cache_file).replace(".pt", "_logits.mmap") if current_use_kd else None
-                            
-                            cached_train_feats = np.memmap(feats_path, dtype='float32', mode='w+', shape=(total_samples, feature_dim))
-                            cached_train_lbls = np.memmap(lbls_path, dtype='int64', mode='w+', shape=(total_samples,))
-                            cached_train_logits = None
+                            if args.disable_cache:
+                                print("  [Info] Large Dataset detected: Using in-memory tensors without feature-cache persistence and DISABLING Data Augmentation.")
+                                cached_train_feats = torch.empty((total_samples, feature_dim), dtype=torch.float32)
+                                cached_train_lbls = torch.empty(total_samples, dtype=torch.long)
+                                cached_train_logits = None
+                                feats_path = None
+                                lbls_path = None
+                                logits_path = None
+                            else:
+                                print("  [Info] Large Dataset detected: Using Disk-based Storage (memmap) and DISABLING Data Augmentation.")
+                                feats_path = str(train_cache_file).replace(".pt", "_feats.mmap")
+                                lbls_path = str(train_cache_file).replace(".pt", "_lbls.mmap")
+                                logits_path = str(train_cache_file).replace(".pt", "_logits.mmap") if current_use_kd else None
+                                cached_train_feats = np.memmap(feats_path, dtype='float32', mode='w+', shape=(total_samples, feature_dim))
+                                cached_train_lbls = np.memmap(lbls_path, dtype='int64', mode='w+', shape=(total_samples,))
+                                cached_train_logits = None
                         else:
                             cached_train_feats = torch.empty((total_samples, feature_dim), dtype=torch.float32)
                             cached_train_lbls = torch.empty(total_samples, dtype=torch.long)
                             cached_train_logits = None
-                        
-                        current_idx = 0 
-                        
+                            feats_path = None
+                            lbls_path = None
+                            logits_path = None
+
                         if is_large_dataset:
-                            lazy_ds = LazyTrainDataset(imgs, lbls, use_kd=current_use_kd)
-                            tmp_loader = DataLoader(lazy_ds, batch_size=BATCH_SIZE, shuffle=False, 
-                                                    num_workers=NUM_WORKERS, pin_memory=True)
-                            for aug_idx in range(args.num_aug_caches):
-                                for x_b, y_b, t_b in tqdm(tmp_loader, desc=f"Augment {aug_idx+1}/{args.num_aug_caches}", leave=False):
-                                    batch_size_actual = x_b.size(0)
-                                    x_b = x_b.to(DEVICE, non_blocking=True)
+                            lazy_ds = LazyTrainDataset(imgs, lbls, use_kd=current_use_kd, augment=False)
+                            tmp_loader = DataLoader(
+                                lazy_ds,
+                                batch_size=BATCH_SIZE,
+                                shuffle=False,
+                                num_workers=NUM_WORKERS,
+                                pin_memory=True
+                            )
+
+                            current_idx = 0
+                            for x_b, y_b, t_b in tqdm(tmp_loader, desc="Extracting features", leave=False):
+                                batch_size_actual = x_b.size(0)
+                                x_b = x_b.to(DEVICE, non_blocking=True)
+                                y_b_np = y_b.cpu().numpy()
+
+                                t_b_np = None
+                                if current_use_kd and t_b.dim() > 0:
+                                    t_b_np = t_b.cpu().numpy()
+                                    if t_b_np.ndim == 1:
+                                        t_b_np = t_b_np.reshape(-1, 1)
+
+                                for aug_idx in range(current_aug_count):
                                     with torch.no_grad(), autocast():
-                                        x_b = gpu_augmentor(x_b)
-                                        f = temp_model.get_features(x_b)
-                                    
-                                    cached_train_feats[current_idx : current_idx + batch_size_actual] = f.cpu().numpy()
-                                    cached_train_lbls[current_idx : current_idx + batch_size_actual] = y_b.cpu().numpy()
-                                    
-                                    if current_use_kd and t_b.dim() > 0:
-                                        t_b_val = t_b.cpu().numpy()
-                                        if t_b_val.ndim == 1: t_b_val = t_b_val.reshape(-1, 1)
+                                        if disable_da:
+                                            x_in = normalize_only(x_b)
+                                        else:
+                                            x_in = gpu_augmentor(x_b)
+                                        f = temp_model.get_features(x_in)
+
+                                    target_idx = aug_idx * len(imgs) + current_idx
+                                    if isinstance(cached_train_feats, np.memmap):
+                                        cached_train_feats[target_idx : target_idx + batch_size_actual] = f.cpu().numpy()
+                                        cached_train_lbls[target_idx : target_idx + batch_size_actual] = y_b_np
+                                    else:
+                                        cached_train_feats[target_idx : target_idx + batch_size_actual] = f.cpu()
+                                        cached_train_lbls[target_idx : target_idx + batch_size_actual] = y_b.cpu()
+
+                                    if t_b_np is not None:
                                         if cached_train_logits is None:
-                                            logit_dim = t_b_val.shape[1]
-                                            cached_train_logits = np.memmap(logits_path, dtype='float32', mode='w+', shape=(total_samples, logit_dim))
-                                        cached_train_logits[current_idx : current_idx + batch_size_actual] = t_b_val
-                                    
-                                    current_idx += batch_size_actual
+                                            logit_dim = t_b_np.shape[1]
+                                            if args.disable_cache:
+                                                cached_train_logits = torch.empty((total_samples, logit_dim), dtype=torch.float32)
+                                            else:
+                                                cached_train_logits = np.memmap(logits_path, dtype='float32', mode='w+', shape=(total_samples, logit_dim))
+                                        if isinstance(cached_train_logits, np.memmap):
+                                            cached_train_logits[target_idx : target_idx + batch_size_actual] = t_b_np
+                                        else:
+                                            cached_train_logits[target_idx : target_idx + batch_size_actual] = torch.from_numpy(t_b_np)
+
+                                current_idx += batch_size_actual
                         else:
-                            if is_real: mem_imgs, mem_lbls, mem_logits = convert_pil_to_tensor_memory(imgs, lbls)
-                            else: mem_imgs, mem_lbls, mem_logits = load_syn_data_to_memory(imgs, lbls, load_logits=current_use_kd)
-                            
+                            if is_real:
+                                mem_imgs, mem_lbls, mem_logits = convert_pil_to_tensor_memory(imgs, lbls)
+                            else:
+                                mem_imgs, mem_lbls, mem_logits = load_syn_data_to_memory(imgs, lbls, load_logits=current_use_kd)
+
                             num_samples_mem = len(mem_imgs)
-                            for aug_idx in range(args.num_aug_caches):
-                                for i in tqdm(range(0, num_samples_mem, BATCH_SIZE), desc=f"Augment {aug_idx+1}/{args.num_aug_caches}", leave=False):
-                                    x_b = mem_imgs[i:i+BATCH_SIZE].to(DEVICE, non_blocking=True)
-                                    y_b = mem_lbls[i:i+BATCH_SIZE]
-                                    t_b = mem_logits[i:i+BATCH_SIZE] if mem_logits is not None else torch.zeros(len(x_b))
-                                    batch_size_actual = x_b.size(0)
+                            current_idx = 0
+                            for i in tqdm(range(0, num_samples_mem, BATCH_SIZE), desc="Extracting features", leave=False):
+                                x_b = mem_imgs[i:i + BATCH_SIZE].to(DEVICE, non_blocking=True)
+                                y_b = mem_lbls[i:i + BATCH_SIZE]
+                                t_b = mem_logits[i:i + BATCH_SIZE] if mem_logits is not None else torch.zeros(len(x_b))
+                                batch_size_actual = x_b.size(0)
+
+                                for aug_idx in range(current_aug_count):
                                     with torch.no_grad(), autocast():
-                                        x_b = gpu_augmentor(x_b)
-                                        f = temp_model.get_features(x_b)
-                                    cached_train_feats[current_idx : current_idx + batch_size_actual] = f.cpu()
-                                    cached_train_lbls[current_idx : current_idx + batch_size_actual] = y_b
+                                        if disable_da:
+                                            x_in = normalize_only(x_b)
+                                        else:
+                                            x_in = gpu_augmentor(x_b)
+                                        f = temp_model.get_features(x_in)
+
+                                    target_idx = aug_idx * num_samples_mem + current_idx
+                                    cached_train_feats[target_idx : target_idx + batch_size_actual] = f.cpu()
+                                    cached_train_lbls[target_idx : target_idx + batch_size_actual] = y_b
+
                                     if current_use_kd and t_b.dim() > 0:
                                         t_b_val = t_b.cpu()
-                                        if t_b_val.ndim == 1: t_b_val = t_b_val.view(-1, 1)
+                                        if t_b_val.ndim == 1:
+                                            t_b_val = t_b_val.view(-1, 1)
+
                                         if cached_train_logits is None:
                                             logit_dim = t_b_val.shape[1]
                                             cached_train_logits = torch.empty((total_samples, logit_dim), dtype=torch.float32)
-                                        cached_train_logits[current_idx : current_idx + batch_size_actual] = t_b_val
-                                    current_idx += batch_size_actual
-                                    
-                        print(f"  [Cache] Saving train features to {train_cache_file}...")
-                        if is_large_dataset:
-                            cached_train_feats.flush()
-                            cached_train_lbls.flush()
-                            if cached_train_logits is not None:
-                                cached_train_logits.flush()
-                                logit_shape = cached_train_logits.shape
-                            else: logit_shape = None
-                            
-                            torch.save({
-                                'is_memmap': True, 'feats_path': feats_path, 'lbls_path': lbls_path,
-                                'logits_path': logits_path, 'shape': (total_samples, feature_dim), 'logit_shape': logit_shape
-                            }, train_cache_file)
-                            
-                            cached_train_feats = torch.from_numpy(cached_train_feats)
-                            cached_train_lbls = torch.from_numpy(cached_train_lbls)
-                            if cached_train_logits is not None: cached_train_logits = torch.from_numpy(cached_train_logits)
+                                        cached_train_logits[target_idx : target_idx + batch_size_actual] = t_b_val
+
+                                current_idx += batch_size_actual
+
+                        if not args.disable_cache:
+                            print(f"  [Cache] Saving train features to {train_cache_file}...")
+                            if is_large_dataset and isinstance(cached_train_feats, np.memmap):
+                                cached_train_feats.flush()
+                                cached_train_lbls.flush()
+                                if cached_train_logits is not None and isinstance(cached_train_logits, np.memmap):
+                                    cached_train_logits.flush()
+                                    logit_shape = cached_train_logits.shape
+                                else:
+                                    logit_shape = None
+
+                                torch.save({
+                                    'is_memmap': True,
+                                    'feats_path': feats_path,
+                                    'lbls_path': lbls_path,
+                                    'logits_path': logits_path,
+                                    'shape': (total_samples, feature_dim),
+                                    'logit_shape': logit_shape
+                                }, train_cache_file)
+
+                                cached_train_feats = torch.from_numpy(cached_train_feats)
+                                cached_train_lbls = torch.from_numpy(cached_train_lbls)
+                                if cached_train_logits is not None and isinstance(cached_train_logits, np.memmap):
+                                    cached_train_logits = torch.from_numpy(cached_train_logits)
+                            else:
+                                torch.save((cached_train_feats, cached_train_lbls, cached_train_logits), train_cache_file)
                         else:
-                            torch.save((cached_train_feats, cached_train_lbls, cached_train_logits), train_cache_file)
-                            
+                            print("  [Cache Disabled] Train features were not saved.")
+
                         train_data = (cached_train_feats, cached_train_lbls, cached_train_logits)
                         del temp_model
                         torch.cuda.empty_cache()
                 else:
-                    is_large_dataset = len(imgs) > MAX_MEMORY_SAMPLES
                     if is_large_dataset:
-                        lazy_ds = LazyTrainDataset(imgs, lbls, use_kd=current_use_kd)
-                        train_data = DataLoader(lazy_ds, batch_size=int(train_config.get("batch_size", 128)), 
-                                                shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+                        lazy_ds = LazyTrainDataset(imgs, lbls, use_kd=current_use_kd, augment=False)
+                        train_data = DataLoader(
+                            lazy_ds,
+                            batch_size=int(train_config.get("batch_size", 128)),
+                            shuffle=True,
+                            num_workers=NUM_WORKERS,
+                            pin_memory=True
+                        )
                     else:
-                        if is_real: train_data = convert_pil_to_tensor_memory(imgs, lbls)
-                        else: train_data = load_syn_data_to_memory(imgs, lbls, load_logits=use_kd)
-                
+                        if is_real:
+                            train_data = convert_pil_to_tensor_memory(imgs, lbls)
+                        else:
+                            train_data = load_syn_data_to_memory(imgs, lbls, load_logits=use_kd)
+
                 trainable_model = TrainableModel(extractor, num_classes).to(DEVICE)
-                acc, t_acc, c_acc_dict = train_fast_unified(trainable_model, train_data, test_loader, args.mode, train_config, 
-                                                use_kd=current_use_kd, cached_test_data=cached_test_data, is_precomputed=is_precomputed)
+                acc, t_acc, c_acc_dict = train_fast_unified(
+                    trainable_model,
+                    train_data,
+                    test_loader,
+                    args.mode,
+                    train_config,
+                    use_kd=current_use_kd,
+                    cached_test_data=cached_test_data,
+                    is_precomputed=is_precomputed,
+                    disable_da=disable_da
+                )
+
                 trial_accs.append(acc)
                 trial_t_accs.append(t_acc)
 
@@ -1042,27 +1254,40 @@ def main():
             max_acc = float(np.max(trial_accs_pct))
             min_acc = float(np.min(trial_accs_pct))
             acc_with_std = f"{mean_acc:.2f} ± {std_acc:.2f}"
-            
+
             print(f"  > {name:<30}: {acc_with_std} (Max: {max_acc:.2f}%, Min: {min_acc:.2f}%, n={len(imgs)})")
-            
+
             result_row = {
-                "Evaluator": eval_name, "Generator": name, "Mode": args.mode, "KD": "none" if is_real else args.kd_mode,
-                "Samples": len(imgs), "Accuracy(%)": mean_acc, "Acc_Std(%)": std_acc, "Acc ± Std": acc_with_std,
-                "Max_Acc(%)": max_acc, "Min_Acc(%)": min_acc, "TrainAcc(%)": float(np.mean(trial_t_accs_pct))
+                "Evaluator": eval_name,
+                "Generator": name,
+                "Mode": args.mode,
+                "KD": "none" if is_real else args.kd_mode,
+                "Samples": len(imgs),
+                "Accuracy(%)": mean_acc,
+                "Acc_Std(%)": std_acc,
+                "Acc ± Std": acc_with_std,
+                "Max_Acc(%)": max_acc,
+                "Min_Acc(%)": min_acc,
+                "TrainAcc(%)": float(np.mean(trial_t_accs_pct))
             }
             save_result_realtime(result_row)
 
             class_row = {
-                "Evaluator": eval_name, "Generator": name, "Mode": args.mode, "KD": "none" if is_real else args.kd_mode,
-                "Samples": len(imgs), "Overall_Acc(%)": mean_acc
+                "Evaluator": eval_name,
+                "Generator": name,
+                "Mode": args.mode,
+                "KD": "none" if is_real else args.kd_mode,
+                "Samples": len(imgs),
+                "Overall_Acc(%)": mean_acc
             }
             for c_id in sorted(inv_class_map.keys()):
                 c_name = inv_class_map[c_id]
                 if class_counts.get(c_id, 0) > 0:
                     c_avg_acc = (sum_class_accs[c_id] / class_counts[c_id]) * 100.0
                     class_row[c_name] = c_avg_acc
-                else: class_row[c_name] = 0.0
-            
+                else:
+                    class_row[c_name] = 0.0
+
             save_class_result_realtime(class_row)
 
         task_queue = []
@@ -1085,7 +1310,8 @@ def main():
 
         if mix_strategies and target_syn_counts:
             for mix_name, source_list in mix_strategies.items():
-                if not source_list: continue
+                if not source_list:
+                    continue
                 for count in target_syn_counts:
                     mix_imgs, mix_lbls = [], []
                     for src in source_list:
@@ -1096,7 +1322,7 @@ def main():
                     task_queue.append((get_sort_weight(task_name), task_name, mix_imgs, mix_lbls, False))
 
         task_queue.sort(key=lambda x: x[0])
-        
+
         for weight, name, imgs, lbls, is_real in task_queue:
             run_exp(name, imgs, lbls, is_real=is_real)
 

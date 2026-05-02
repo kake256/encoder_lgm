@@ -29,7 +29,9 @@ def set_seed(seed: int = 42):
 
 def norm_name(s: str) -> str:
     s = s.lower()
-    s = re.sub(r"[^a-z0-9_]+", "", s.replace(" ", "_").replace(".", "_"))
+    #s = re.sub(r"[^a-z0-9_]+", "", s.replace(" ", "_").replace(".", "_"))
+    # スペースやドットをアンダースコアに変換した後、英数字以外を削除
+    s = s.replace(" ", "").replace("_", "").replace(".", "").replace("-", "")
     return re.sub(r"_+", "_", s).strip("_")
 
 class ImageDataset(Dataset):

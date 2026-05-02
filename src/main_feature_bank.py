@@ -1,6 +1,6 @@
 # =========================
 # src/main_feature_bank.py
-# (Fix: Fetch Class Names for Readable Directory Names)
+# (Fix: Fetch Class Names for Readable Directory Names & Adaptive num_classes)
 # =========================
 import os
 import sys
@@ -16,6 +16,8 @@ from torchvision.transforms.functional import to_tensor, to_pil_image
 import torch.nn.functional as F
 from tqdm import tqdm
 from datasets import load_dataset
+# 追加: メタデータ取得用
+from datasets import load_dataset_builder 
 import pandas as pd
 from torchvision import models
 from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -59,7 +61,13 @@ class Evaluator:
             processed = self.resnet_transform(img_tensor)
             logits = self.resnet(processed)
             probs = F.softmax(logits, dim=1)
-            score = probs[0, target_class_idx].item()
+            # ImageNet-100の場合、ResNet50(ImageNet-1k学習済)のインデックスとは一致しない可能性があるため
+            # 厳密なスコア評価にはマッピングが必要だが、ここでは簡易的にそのまま取得する
+            # (本格的に評価する場合は評価用モデルもRetrainしたものが必要)
+            if target_class_idx < 1000:
+                score = probs[0, target_class_idx].item()
+            else:
+                score = 0.0
             top1_prob, top1_idx = torch.max(probs, dim=1)
         return score, top1_idx.item(), top1_prob.item()
 
@@ -172,9 +180,11 @@ def collect_target_images(dataset, target_class_ids, images_per_class, max_scan_
                 break
     return collected_images
 
-# ★追加: データセットロードなしでクラス名を取得する関数
-def load_class_names_offline(cache_dir):
-    json_path = os.path.join(cache_dir, "imagenet_labels.json")
+# ★修正: データセットロードなしでクラス名を取得する関数 (Dataset対応版)
+def load_class_names_offline(cache_dir, dataset_type="imagenet-1k"):
+    # データセット名に基づいてファイル名を決定 (例: CUB_labels.json)
+    safe_name = re.sub(r"[^a-zA-Z0-9]", "_", dataset_type)
+    json_path = os.path.join(cache_dir, f"{safe_name}_labels.json")
     
     # 1. ローカルキャッシュがあれば使う
     if os.path.exists(json_path):
@@ -184,20 +194,73 @@ def load_class_names_offline(cache_dir):
         except:
             pass
             
-    # 2. なければHuggingFace公式からダウンロード
-    url = "https://huggingface.co/datasets/huggingface/label-files/resolve/main/imagenet-1k-id2label.json"
-    try:
-        with urllib.request.urlopen(url) as response:
-            id2label = json.loads(response.read().decode())
-            # ID順のリストに変換
-            names = [id2label[str(i)] for i in range(1000)]
-            # 次回用に保存
-            with open(json_path, "w") as f:
-                json.dump(names, f)
+    # --- [変更点] ImageNet-100 用のロジックを追加 ---
+    if "imagenet-100" in dataset_type:
+        try:
+            # datasets.load_dataset_builder を使ってメタデータのみ取得（高速）
+            ds_builder = load_dataset_builder(dataset_type, trust_remote_code=True)
+            names = ds_builder.info.features['label'].names
+            with open(json_path, "w") as f: json.dump(names, f)
             return names
-    except Exception as e:
-        # 失敗時は数字
-        return [str(i) for i in range(1000)]
+        except Exception as e:
+            print(f"[Warning] Failed to fetch ImageNet-100 labels: {e}")
+            # 失敗時は後続の処理へフォールバック
+    # ---------------------------------------------
+
+    # 2. キャッシュがない場合、datasetsライブラリで軽量取得を試みる (Food/CUB対応)
+    try:
+        from datasets import load_dataset
+        # streaming=Trueなら画像ダウンロードなしでメタデータのみ取得可能
+        ds = load_dataset(dataset_type, split="train", streaming=True, trust_remote_code=True)
+        if hasattr(ds, "features") and "label" in ds.features:
+            names = ds.features["label"].names
+            with open(json_path, "w") as f: json.dump(names, f)
+            return names
+    except Exception:
+        pass
+
+    # 3. ImageNetのフォールバック (既存ロジック)
+    # 元の条件: if "imagenet" in dataset_type.lower():
+    # 修正: 他のImageNet派生(100等)でここに入らないように厳密化、または100用の処理を上に書いたのでそのままでも可
+    if "imagenet" in dataset_type.lower() and "100" not in dataset_type:
+        url = "https://huggingface.co/datasets/huggingface/label-files/resolve/main/imagenet-1k-id2label.json"
+        try:
+            with urllib.request.urlopen(url) as response:
+                id2label = json.loads(response.read().decode())
+                # ID順のリストに変換
+                names = [id2label[str(i)] for i in range(1000)]
+                # 次回用に保存
+                with open(json_path, "w") as f:
+                    json.dump(names, f)
+                return names
+        except Exception as e:
+            pass
+            
+    # 失敗時は数字
+    # デフォルトで1000を返していたが、Dataset名に100が含まれていれば100を返す簡易ロジック
+    default_count = 100 if "100" in dataset_type else 1000
+    return [str(i) for i in range(default_count)]
+
+# ==========================================
+# 追加機能: 完了状況を記録する関数 (CSV形式)
+# ==========================================
+def append_completion_log(output_dir, class_id, class_name, exp_name, gen_idx):
+    """生成が完了した画像の情報をCSVに追記する"""
+    import datetime
+    
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "completion_log.csv")
+    
+    # ファイルがなければヘッダーを作成
+    if not os.path.exists(log_path):
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("Timestamp,Class_ID,Class_Name,Experiment,Gen_Idx,Status\n")
+            
+    # 完了情報を追記
+    with open(log_path, "a", encoding="utf-8") as f:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # カンマ区切りで書き込み
+        f.write(f"{ts},{class_id},{class_name},{exp_name},{gen_idx},DONE\n")
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -242,6 +305,7 @@ def parse_args():
     parser.add_argument("--no_evaluation", action="store_true", help="Skip real image loading and SSIM/LPIPS evaluation")
     
     return parser.parse_args()
+
 
 if __name__ == "__main__":
     args = parse_args()
@@ -304,6 +368,14 @@ if __name__ == "__main__":
         except Exception as e:
             logger.log(f"Error loading dataset: {e}")
             sys.exit(1)
+        
+        # ▼▼▼ 追加: ラベルリストをキャッシュとして保存 (Phase 1など) ▼▼▼
+        if dataset_class_names:
+            safe_name = re.sub(r"[^a-zA-Z0-9]", "_", args.dataset_type)
+            lbl_path = os.path.join(args.cache_dir, f"{safe_name}_labels.json")
+            with open(lbl_path, "w") as f:
+                json.dump(dataset_class_names, f)
+        # ▲▲▲ 追加ここまで ▲▲▲
 
         images_per_class = args.use_real if args.use_real > 0 else 50
         
@@ -313,12 +385,15 @@ if __name__ == "__main__":
     else:
         # Phase 2: ロードスキップ時でも、名称のためにラベルリストを取得する
         target_ids_to_run = [int(t) for t in args.target_classes] if args.target_classes else []
-        # ★追加: 公式定義からラベルリストを取得
-        dataset_class_names = load_class_names_offline(args.cache_dir)
+        # ★修正: 引数に dataset_type を渡す
+        dataset_class_names = load_class_names_offline(args.cache_dir, args.dataset_type)
 
     # dataset_class_names が空なら数字で埋める
     if not dataset_class_names:
-        dataset_class_names = [str(i) for i in range(1000)]
+        # dataset_class_names = [str(i) for i in range(1000)] # [元のコード]
+        # [変更]: データセットに合わせてデフォルト数を変更
+        default_count = 100 if "100" in args.dataset_type else 1000
+        dataset_class_names = [str(i) for i in range(default_count)]
 
     # -------------------------------------------------------------
     # Model Initialization
@@ -327,9 +402,16 @@ if __name__ == "__main__":
     proj_dims = args.projection_dims
     if len(proj_dims) == 1: proj_dims = proj_dims * len(args.encoder_names)
     
-    logger.log("Initializing Models...")
+    # [変更] クラス数をデータセットに合わせて動的に決定する
+    n_classes_adaptive = len(dataset_class_names)
+    logger.log(f"Initializing Models with num_classes={n_classes_adaptive} (Dataset: {args.dataset_type})...")
+
     for name, p_dim in zip(args.encoder_names, proj_dims):
-        m = EncoderClassifier(name, freeze_encoder=True, num_classes=1000, projection_dim=p_dim)
+        # [元のコード] 
+        # m = EncoderClassifier(name, freeze_encoder=True, num_classes=1000, projection_dim=p_dim)
+        
+        # [変更コード] num_classes に n_classes_adaptive を渡す
+        m = EncoderClassifier(name, freeze_encoder=True, num_classes=n_classes_adaptive, projection_dim=p_dim)
         m.to(device)
         m.eval()
         models_list.append(m)
@@ -365,6 +447,21 @@ if __name__ == "__main__":
             real_images_pool = torch.empty(0)
             ref_clean_tensor_cpu = None
         
+        # ==========================================
+        # ★追加: ソース画像のサンプル保存 (最初の10枚)
+        # ==========================================
+        if len(real_images_pool) > 0:
+            sample_save_dir = os.path.join(args.output_dir, "source_samples", f"{target_cls}_{sanitize_dirname(class_name)}")
+            os.makedirs(sample_save_dir, exist_ok=True)
+            # 保存枚数 (最大1300枚)
+            num_save = min(1300, len(real_images_pool))
+            for i in range(num_save):
+                save_path = os.path.join(sample_save_dir, f"sample_{i:03d}.png")
+                # すでにファイルがあっても上書き保存
+                save_image(real_images_pool[i], save_path)
+            logger.log(f"  Saved {num_save} source samples to {sample_save_dir}")
+        # ==========================================
+
         feature_bank_list = bank_system.create_or_load_bank(models_list, real_images_pool, target_cls, logger)
         
         del real_images_pool
@@ -423,6 +520,11 @@ if __name__ == "__main__":
                     "gen_idx": gen_idx, "result_visual_score": vis_score,
                     "result_text_score": text_score, "ssim": ssim_val, "lpips": lpips_val
                 })
+
+                # ▼▼▼ 追加ここから ▼▼▼
+                # 1枚終わるごとにログファイルに記録する
+                append_completion_log(args.output_dir, target_cls, class_name, exp_name, gen_idx)
+                # ▲▲▲ 追加ここまで ▲▲▲
                 
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
 
